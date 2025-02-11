@@ -23,6 +23,7 @@ def xy_to_latlon(X, Y, lat0_deg, lon0_deg):
     lat0 = math.radians(lat0_deg)
     lon0 = math.radians(lon0_deg)
 
+    # Fazemos as contas inversas
     lat = Y / R + lat0
     lon = X / (R * math.cos(lat0)) + lon0
 
@@ -34,7 +35,6 @@ def xy_to_latlon(X, Y, lat0_deg, lon0_deg):
 def main():
     global clicked_point
 
-    # Carregar a imagem
     image_path = r"C:\Users\35196\OneDrive\Ambiente de Trabalho\tese\Tese_code\SafeRoadside\pix2gps\tes.png"
     img = cv2.imread(image_path)
     if img is None:
@@ -45,34 +45,29 @@ def main():
     try:
         with open("map.txt", "r") as f:
             lines = f.readlines()
-        # Formato esperado:
-        # linha 1: lat0_deg lon0_deg
-        # linha 2..4: h11 h12 h13
-        #            h21 h22 h23
-        #            h31 h32 h33
+        # Exemplo:
+        # linha 1: lat0_deg, lon0_deg
+        # linha 2: a11, a12, a13
+        # linha 3: a21, a22, a23
         lat0_deg, lon0_deg = map(float, lines[0].split())
-
-        # Lê as próximas 3 linhas e converte para float
-        h_rows = []
-        for i in range(1, 4):
-            row_vals = list(map(float, lines[i].split()))
-            h_rows.append(row_vals)
-
-        homography_mat = np.array(h_rows, dtype=np.float32)  # shape (3, 3)
+        a11, a12, a13 = map(float, lines[1].split())
+        a21, a22, a23 = map(float, lines[2].split())
+        affine_mat = np.array([[a11, a12, a13],
+                               [a21, a22, a23]], dtype=np.float32)
     except Exception as e:
         print("Erro a ler map.txt:", e)
         return
 
-    if homography_mat.shape != (3, 3):
-        print("Matriz de homografia não tem dimensões 3x3.")
+    if affine_mat.shape != (2, 3):
+        print("Matriz afim em map.txt não tem dimensões 2x3.")
         return
 
     # Preparar janela
     cv2.namedWindow("Clica no ponto para ver lat/lon")
     cv2.setMouseCallback("Clica no ponto para ver lat/lon", mouse_callback)
 
-    print("Instruções: clica em qualquer ponto para converter pixel -> lat/lon.\n"
-          "Pressiona ESC para sair.")
+    print("Instruções: clica em qualquer ponto para converter de pixel -> lat/lon.\n"
+          "ESC para sair.")
 
     while True:
         disp = img.copy()
@@ -84,28 +79,19 @@ def main():
         if clicked_point is not None:
             px, py = clicked_point
 
-            # Aplicar a homografia para obter (X, Y) local
-            # [X, Y, W]^T = H * [px, py, 1]^T
-            pt = np.array([[px], [py], [1]], dtype=np.float32)
-            XYW = homography_mat @ pt
-            X = XYW[0, 0]
-            Y = XYW[1, 0]
-            W = XYW[2, 0]
+            # Transformar pixel -> (X, Y) local
+            # [X, Y]^T = A * [px, py, 1]^T
+            X = affine_mat[0, 0]*px + affine_mat[0, 1]*py + affine_mat[0, 2]
+            Y = affine_mat[1, 0]*px + affine_mat[1, 1]*py + affine_mat[1, 2]
 
-            if abs(W) < 1e-12:
-                print("W muito próximo de zero; resultado instável.")
-            else:
-                X /= W
-                Y /= W
-
-            # Converter (X, Y) local -> (lat, lon)
+            # Converter (X, Y) local para (lat, lon)
             lat_deg, lon_deg = xy_to_latlon(X, Y, lat0_deg, lon0_deg)
 
-            print(f"\nPixel=({px}, {py})"
-                  f"\n -> local (X, Y) = ({X:.3f}, {Y:.3f})"
-                  f"\n -> lat/lon = ({lat_deg:.6f}°, {lon_deg:.6f}°)\n")
+            print(f"\nPixel=({px}, {py})\n"
+                  f"-> local (X, Y) = ({X:.3f}, {Y:.3f}) pix dist\n"
+                  f"-> lat/lon = ({lat_deg:.6f}°, {lon_deg:.6f}°)\n")
 
-            # Reset para permitir novo clique
+            # Reset para poder clicar noutro ponto
             clicked_point = None
 
     cv2.destroyAllWindows()
