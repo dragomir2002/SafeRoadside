@@ -63,8 +63,8 @@ def parse_coord(coord_str):
 
 def main():
     # Coordenadas fornecidas
-    true_coord = "38.877577°N 7.172632°W"
-    pred_coord = (38.877579, -7.172634)  # Já está em formato correto
+    true_coord = "41.940637°N 85.000672°W"
+    pred_coord = (41.940638, -85.000669)  # Já está em formato correto
     
     # Converter "true" para formato decimal
     true_lat, true_lon = parse_coord(true_coord)
