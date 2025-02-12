@@ -33,7 +33,7 @@ predefined_trajectories = load_trajectories("trajetoriasClean.txt")
 
 # Função para encontrar a melhor trajetória correspondente
 def find_best_trajectory(current_traj, predefined_trajs, max_points=50):
-    if len(current_traj) < 4:
+    if len(current_traj) < 1:
         return []
     
     best_score = float('inf')
@@ -91,8 +91,8 @@ def ekf(previous_points, prediction_range):
     return predictions
 
 # Configuração de YOLO e DeepSORT
-model = YOLO("models/yolo11n.pt").to('cuda')
-tracker = DeepSort(max_age=1000, n_init=1, nn_budget=50, embedder_gpu=True)
+model = YOLO("models/yolo11n.pt")
+tracker = DeepSort(max_age=1000, n_init=1, nn_budget=50)
 
 screen_width, screen_height = pyautogui.size()
 screen_region = {"top": 0, "left": 0, "width": screen_width, "height": screen_height}
