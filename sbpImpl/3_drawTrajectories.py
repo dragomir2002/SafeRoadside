@@ -18,7 +18,7 @@ tela = pygame.display.set_mode(TAMANHO)
 pygame.display.set_caption("Simulador de Movimentos")
 
 # Carregar a imagem de fundo (certifique-se de que o caminho está correto)
-background = pygame.image.load('road.png')
+background = pygame.image.load('withguide.png')
 background = pygame.transform.scale(background, TAMANHO)
 
 # Função para gerar cor aleatória
