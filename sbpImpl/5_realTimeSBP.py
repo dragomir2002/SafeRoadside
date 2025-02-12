@@ -35,7 +35,7 @@ def load_trajectories(file_path):
 predefined_trajectories = load_trajectories("trajetoriasClean.txt")
 
 # Função para encontrar a melhor trajetória correspondente
-def find_best_trajectory(current_traj, predefined_trajs, max_points=30):
+def find_best_trajectory(current_traj, predefined_trajs, max_points=50):
     if len(current_traj) < 1:
         return []
     
@@ -109,7 +109,7 @@ def ekf(previous_points, prediction_range):
 
 # Configurações iniciais
 model = YOLO("models/yolo11n.pt")
-tracker = DeepSort(max_age=45, n_init=4, nn_budget=100)
+tracker = DeepSort(max_age=1000, n_init=1, nn_budget=50)
 screen_width, screen_height = pyautogui.size()
 screen_region = {"top": 0, "left": 0, "width": screen_width, "height": screen_height}
 
@@ -185,7 +185,8 @@ with mss() as sct:
             # Gerar previsões
             predictions = []
             if obj.lower() in vehicle_classes:
-                current_traj = list(point_history[track_id])
+                # last 10 items
+                current_traj = list(point_history[track_id])[-10:]
                 predictions = find_best_trajectory(current_traj, predefined_trajectories)
 
             # Desenhar resultados
