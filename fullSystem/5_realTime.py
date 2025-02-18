@@ -9,6 +9,7 @@ import pyautogui
 import logging
 import sys
 import math
+import struct
 
 # -----------------------------------------------------------------------------
 # CONFIGURAÇÃO DE LOGGING
@@ -239,9 +240,27 @@ vehicle_classes = ['car', 'truck', 'bus', 'motorcycle']
 pedestrian_class = 'person'
 
 
+
+
 # -----------------------------------------------------------------------------
 # 7) FUNÇÕES DE APOIO
 # -----------------------------------------------------------------------------
+
+def gps2hex(lat, lon):
+    """
+    Converte coordenadas GPS (latitude, longitude) para o formato hexadecimal IEEE 754 (double, 64 bits).
+    Retorna uma string formatada como "0xNN 0xNN ..."
+    """
+    # Converter para double (IEEE 754, 64 bits, big-endian)
+    lat_bytes = struct.pack('>d', lat)
+    lon_bytes = struct.pack('>d', lon)
+    
+    # Formatar como string hexadecimal
+    lat_hex = ' '.join(f'0x{b:02X}' for b in lat_bytes)
+    lon_hex = ' '.join(f'0x{b:02X}' for b in lon_bytes)
+    
+    return f"{lat_hex} {lon_hex}"
+
 def get_random_color():
     """Gera uma cor aleatória em formato BGR."""
     return (random.randint(0, 255), random.randint(0, 255), random.randint(0, 255))
@@ -368,6 +387,12 @@ def main():
                             # 7.3) Imprimir alerta no terminal com LAT/LON
                             print(f"[ALERTA] Possível colisão futura em pixel=({Px},{Py}) "
                                   f"-> lat/lon=({lat_deg:.6f}, {lon_deg:.6f})")
+                            
+                            # 7.4) Escrever alerta no ficheiro 'data.txt'
+                            file_path = r"C:\Users\35196\OneDrive\Ambiente de Trabalho\tese\Tese_code\SafeRoadside\shared\data.txt"
+
+                            with open(file_path, "a", encoding="utf-8") as file:
+                                file.write(f"{gps2hex(lat_deg,lon_deg)}\n")
 
             # 8) Exibição
             cv2.imshow("Tracking Inteligente", frame)
