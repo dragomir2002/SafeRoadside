@@ -5,6 +5,24 @@ import os
 # Inicia o bluetoothctl como um processo interativo
 bluetoothctl = pexpect.spawn("sudo bluetoothctl", encoding="utf-8", timeout=5)
 
+import struct
+
+def gps2hex(lat, lon):
+    """
+    Converte coordenadas GPS (latitude, longitude) para o formato hexadecimal IEEE 754 (double, 64 bits).
+    Retorna uma string formatada como "0xNN 0xNN ..."
+    """
+    # Converter para double (IEEE 754, 64 bits, big-endian)
+    lat_bytes = struct.pack('>d', lat)
+    lon_bytes = struct.pack('>d', lon)
+    
+    # Formatar como string hexadecimal
+    lat_hex = ' '.join(f'0x{b:02X}' for b in lat_bytes)
+    lon_hex = ' '.join(f'0x{b:02X}' for b in lon_bytes)
+    
+    return f"{lat_hex}{lon_hex}"
+
+
 def send_command(command):
     """Envia um comando para o bluetoothctl e aguarda a resposta."""
     bluetoothctl.sendline(command)
@@ -16,7 +34,7 @@ send_command("power on")
 send_command("menu advertise")
 send_command("interval 60 100")
 send_command("manufacturer 0xFF 0x00 0x00 0x00")  # Começa com valor fixo
-send_command("name ServicoZe")
+send_command("name SafeRSU")
 send_command("back")
 send_command("advertise on")
 send_command("menu advertise")
