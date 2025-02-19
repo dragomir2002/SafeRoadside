@@ -34,7 +34,10 @@ def watch_file(filename):
                 if first_line:
                     print(f"[Thread] Enviando novos dados: 0xFF {first_line}")
                     send_command(f"manufacturer 0xFF {first_line}")
-                # Se for vazia, simplesmente ignora
+                # Se for vazia, envia null
+            else: 
+                    print(f"[Thread] Ficheiro vazio: 0xFF 0x00 0x00 0x00")
+                    send_command(f"manufacturer 0xFF 0x00 0x00 0x00")       
         # Aguarda um pouco antes de verificar de novo
         time.sleep(0.5)
 
