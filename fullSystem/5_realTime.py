@@ -388,11 +388,16 @@ def main():
                             print(f"[ALERTA] Possível colisão futura em pixel=({Px},{Py}) "
                                   f"-> lat/lon=({lat_deg:.6f}, {lon_deg:.6f})")
                             
-                            # 7.4) Escrever alerta no ficheiro 'data.txt'
+                            # 7.4) Escrever alerta no ficheiro 'data.txt' (escrever pouquinho 5 linhas max)
                             file_path = r"C:\Users\35196\OneDrive\Ambiente de Trabalho\tese\Tese_code\SafeRoadside\shared\data.txt"
 
-                            with open(file_path, "a", encoding="utf-8") as file:
-                                file.write(f"{gps2hex(lat_deg,lon_deg)}\n")
+                            with open(file_path, "r", encoding="utf-8") as file:
+                                lines = file.readlines()
+
+                            if len(lines) < 5:
+                                with open(file_path, "a", encoding="utf-8") as file:
+                                    file.write(f"{gps2hex(lat_deg, lon_deg)}\n")
+
 
             # 8) Exibição
             cv2.imshow("Tracking Inteligente", frame)
