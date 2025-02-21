@@ -246,16 +246,24 @@ pedestrian_class = 'person'
 # 7) FUNÇÕES DE APOIO
 # -----------------------------------------------------------------------------
 
-def gps2hex(lat, lon):
+def gps2hex(lat: float, lon: float) -> str:
     """
-    Converte coordenadas GPS (latitude, longitude) para o formato hexadecimal IEEE 754 (double, 64 bits).
-    Retorna uma string formatada como "0xNN 0xNN ..."
-    """
-    # Converter para double (IEEE 754, 64 bits, big-endian)
-    lat_bytes = struct.pack('>d', lat)
-    lon_bytes = struct.pack('>d', lon)
+    Converte coordenadas GPS (latitude, longitude) para um inteiro 32-bit representado em hexadecimal.
+    O input deve ser um double (float) e o output é o int32 respetivo em hexadecimal.
     
-    # Formatar como string hexadecimal
+    Utiliza um fator de escala de 1e7 (10.000.000) para preservar 7 casas decimais.
+    Retorna uma string formatada como "0xNN 0xNN ..." (4 bytes para cada coordenada).
+    """
+    scale = 10_000_000  # fator de escala para preservar casas decimais
+    # Converter o float para int32 (com arredondamento)
+    lat_int = int(round(lat * scale))
+    lon_int = int(round(lon * scale))
+    
+    # Empacotar os inteiros em 4 bytes cada (big-endian)
+    lat_bytes = struct.pack('>i', lat_int)
+    lon_bytes = struct.pack('>i', lon_int)
+    
+    # Converter os bytes para uma string hexadecimal
     lat_hex = ' '.join(f'0x{b:02X}' for b in lat_bytes)
     lon_hex = ' '.join(f'0x{b:02X}' for b in lon_bytes)
     
