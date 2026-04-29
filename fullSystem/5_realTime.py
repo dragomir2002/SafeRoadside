@@ -5,11 +5,13 @@ from ultralytics import YOLO
 from deep_sort_realtime.deepsort_tracker import DeepSort
 from collections import deque
 import random
-import pyautogui
 import logging
 import sys
 import math
 import struct
+import os
+import argparse
+import time
 
 # -----------------------------------------------------------------------------
 # CONFIGURAÇÃO DE LOGGING
@@ -209,13 +211,15 @@ def ekf(previous_points, prediction_range=5):
 # -----------------------------------------------------------------------------
 # 4) CONFIGURAÇÃO DE YOLO E DEEPSORT
 # -----------------------------------------------------------------------------
-model = YOLO("models/yolo11n.pt").to('cuda')
-tracker = DeepSort(
+model = YOLO("models/yolo11x.pt").to('cuda') # TODO é possivel alterar ete valor para outros modelos do YOLO
+tracker = DeepSort( # TODO ver se ja outra versoes mais fortes do yolo
     max_age=1000,
     n_init=5,
     nn_budget=10,
     embedder_gpu=True
 )
+
+# TODO da para mudar o YOLO para outras coisas tipo modelos treinaddos so em carros
 
 # -----------------------------------------------------------------------------
 # 5) CARREGAR MAPA (lat/lon + HOMOGRAFIA) E TRAJETÓRIAS
@@ -226,9 +230,6 @@ predefined_trajectories = load_trajectories("trajetoriasClean.txt")
 # -----------------------------------------------------------------------------
 # 6) VARIÁVEIS GLOBAIS
 # -----------------------------------------------------------------------------
-screen_width, screen_height = pyautogui.size()
-screen_region = {"top": 0, "left": 0, "width": screen_width, "height": screen_height}
-
 color_map = {}
 point_history = {}
 missing_track_counter = {}
@@ -238,6 +239,135 @@ COLLISION_THRESHOLD = 30
 
 vehicle_classes = ['car', 'truck', 'bus', 'motorcycle']
 pedestrian_class = 'person'
+
+
+# -----------------------------------------------------------------------------
+# 6.1) INPUT SOURCE — video file, specific monitor, or screen region
+# -----------------------------------------------------------------------------
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="SafeRoadside — Real-time collision detection",
+        formatter_class=argparse.RawTextHelpFormatter
+    )
+    parser.add_argument(
+        "--source", type=str, default=None,
+        help=(
+            "Input source. Options:\n"
+            "  path/to/video.mp4   — use a video file\n"
+            "  monitor:N           — capture monitor N (1=primary, 2=secondary, ...)\n"
+            "  region:X,Y,W,H     — capture a screen region\n"
+            "  (omit)              — interactive monitor picker"
+        )
+    )
+    parser.add_argument(
+        "--loop", action="store_true",
+        help="Loop video file when it ends (only for --source video)"
+    )
+    return parser.parse_args()
+
+
+class VideoSource:
+    """Reads frames from a video file."""
+    def __init__(self, path, loop=False):
+        self.path = path
+        self.loop = loop
+        self.cap = cv2.VideoCapture(path)
+        if not self.cap.isOpened():
+            print(f"[ERRO] Cannot open video: {path}")
+            sys.exit(1)
+        w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        print(f"[INFO] Source: video '{path}' ({w}x{h})")
+
+    def grab(self):
+        ret, frame = self.cap.read()
+        if not ret:
+            if self.loop:
+                self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                ret, frame = self.cap.read()
+            if not ret:
+                return None
+        return frame
+
+    def release(self):
+        self.cap.release()
+
+
+class ScreenSource:
+    """Captures a specific monitor or screen region via mss."""
+    def __init__(self, region):
+        self.sct = mss()
+        self.region = region
+
+    def grab(self):
+        screenshot = self.sct.grab(self.region)
+        frame = np.array(screenshot, dtype=np.uint8)
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+        return frame
+
+    def release(self):
+        pass
+
+
+def pick_monitor_interactive():
+    """Lists all monitors and lets the user pick one."""
+    sct = mss()
+    monitors = sct.monitors  # [0] = all monitors combined, [1..N] = individual
+    print("\n============================================")
+    print("  Available monitors:")
+    print("============================================")
+    for i, m in enumerate(monitors):
+        label = "ALL (virtual)" if i == 0 else f"Monitor {i}"
+        print(f"  {i}) {label}  —  {m['width']}x{m['height']}  at  ({m['left']}, {m['top']})")
+    print("============================================")
+
+    while True:
+        try:
+            choice = int(input(f"\nSelect monitor [1-{len(monitors)-1}] (or 0 for all): "))
+            if 0 <= choice < len(monitors):
+                selected = monitors[choice]
+                label = "ALL (virtual)" if choice == 0 else f"Monitor {choice}"
+                print(f"[INFO] Source: {label} ({selected['width']}x{selected['height']})")
+                return selected
+            else:
+                print(f"  Invalid. Choose 0 to {len(monitors)-1}.")
+        except (ValueError, EOFError):
+            print(f"  Invalid input. Choose 0 to {len(monitors)-1}.")
+
+
+def create_source(args):
+    """Factory: builds the right source from CLI arguments."""
+    source_str = args.source
+
+    # No argument → interactive monitor picker
+    if source_str is None:
+        region = pick_monitor_interactive()
+        return ScreenSource(region)
+
+    # monitor:N
+    if source_str.startswith("monitor:"):
+        idx = int(source_str.split(":")[1])
+        sct = mss()
+        if idx < 0 or idx >= len(sct.monitors):
+            avail = len(sct.monitors) - 1
+            print(f"[ERRO] Monitor {idx} not found. Available: 0..{avail}")
+            for i, m in enumerate(sct.monitors):
+                print(f"  {i}) {m['width']}x{m['height']} at ({m['left']},{m['top']})")
+            sys.exit(1)
+        m = sct.monitors[idx]
+        print(f"[INFO] Source: monitor {idx} ({m['width']}x{m['height']})")
+        return ScreenSource(m)
+
+    # region:X,Y,W,H
+    if source_str.startswith("region:"):
+        parts = source_str.split(":")[1].split(",")
+        x, y, w, h = int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3])
+        region = {"top": y, "left": x, "width": w, "height": h}
+        print(f"[INFO] Source: screen region {w}x{h} at ({x},{y})")
+        return ScreenSource(region)
+
+    # Otherwise → video file
+    return VideoSource(source_str, loop=args.loop)
 
 
 
@@ -282,23 +412,54 @@ def is_point_far_enough(new_point, last_point, threshold=MIN_DISTANCE_THRESHOLD)
 # 8) LOOP PRINCIPAL
 # -----------------------------------------------------------------------------
 def main():
-    with mss() as sct:
-        while True:
-            # 1) Captura de tela
-            screenshot = sct.grab(screen_region)
-            frame = np.array(screenshot, dtype=np.uint8)
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+    args = parse_args()
+    source = create_source(args)
 
-            # 2) Detecção com YOLO
-            results = model.predict(frame, verbose=False)
+    # FPS tracking
+    fps = 0.0
+    frame_count = 0
+    fps_start = time.time()
+
+    # YOLO inference size (smaller = faster). Original frame kept for display.
+    INFER_WIDTH = 1920
+
+    print("[INFO] Starting detection loop... (press 'q' on the window to quit)")
+
+    try:
+        while True:
+            t0 = time.time()
+
+            # 1) Captura do frame
+            frame = source.grab()
+            if frame is None:
+                print("[INFO] End of video / no more frames.")
+                break
+
+            orig_h, orig_w = frame.shape[:2]
+
+            # 2) Resize for YOLO inference if frame is too large
+            if orig_w > INFER_WIDTH:
+                scale = INFER_WIDTH / orig_w
+                infer_frame = cv2.resize(frame, (INFER_WIDTH, int(orig_h * scale)))
+            else:
+                scale = 1.0
+                infer_frame = frame
+
+            # 3) Detecção com YOLO (on smaller frame)
+            results = model.predict(infer_frame, verbose=False)
             yolo_boxes = results[0].boxes
 
-            # 3) Converter predições YOLO para DeepSort
+            # 4) Converter predições YOLO para DeepSort (scale back to original)
             detections = []
             for box in yolo_boxes:
                 x1, y1, x2, y2 = map(int, box.xyxy[0])
                 confidence = float(box.conf[0])
                 class_id = int(box.cls[0])
+                if scale != 1.0:
+                    x1 = int(x1 / scale)
+                    y1 = int(y1 / scale)
+                    x2 = int(x2 / scale)
+                    y2 = int(y2 / scale)
                 detections.append(([x1, y1, x2 - x1, y2 - y1], confidence, class_id))
 
             # 4) Atualização do tracker
@@ -350,21 +511,17 @@ def main():
 
                 # 6) Gera predições futuras
                 if obj_class in vehicle_classes:
-                    past_points = list(point_history[track_id])[-20:]  # até 20 pts
+                    past_points = list(point_history[track_id])[-20:]
                     best_traj = find_best_trajectory(past_points, predefined_trajectories, max_points=50)
-                    # Desenhar
                     for pt in best_traj:
                         cv2.circle(frame, (int(pt[0]), int(pt[1])), 5, color, -1)
-                    # Salvar
                     future_car_points.extend(best_traj)
 
                 elif obj_class == pedestrian_class:
                     past_points = list(point_history[track_id])[-10:]
                     pred_points = ekf(past_points, prediction_range=5)
-                    # Desenhar
                     for pt in pred_points:
                         cv2.circle(frame, (int(pt[0]), int(pt[1])), 5, color, -1)
-                    # Salvar
                     future_person_points.extend(pred_points)
 
             # 7) DETECTAR POSSÍVEIS COLISÕES (EM PIXEL) E CONVERTER P/ GPS
@@ -372,15 +529,11 @@ def main():
                 for person_pt in future_person_points:
                     dist = np.linalg.norm(np.array(car_pt) - np.array(person_pt))
                     if dist < COLLISION_THRESHOLD:
-                        # (Px, Py) = pixel de colisão
                         Px = int((car_pt[0] + person_pt[0]) / 2)
                         Py = int((car_pt[1] + person_pt[1]) / 2)
 
-                        # 7.1) Desenhar alerta
                         cv2.circle(frame, (Px, Py), 20, (0, 0, 255), -1)
 
-                        # 7.2) Converter pixel -> (X, Y) -> (lat, lon)
-                        # [X, Y, W]^T = homography_mat * [Px, Py, 1]^T
                         pt = np.array([[Px], [Py], [1]], dtype=np.float32)
                         XYW = homography_mat @ pt
                         X, Y, W = XYW[0, 0], XYW[1, 0], XYW[2, 0]
@@ -392,12 +545,10 @@ def main():
                             Y /= W
                             lat_deg, lon_deg = xy_to_latlon(X, Y, lat0_deg, lon0_deg)
 
-                            # 7.3) Imprimir alerta no terminal com LAT/LON
                             print(f"[ALERTA] Possível colisão futura em pixel=({Px},{Py}) "
                                   f"-> lat/lon=({lat_deg:.6f}, {lon_deg:.6f})")
-                            
-                            # 7.4) Escrever alerta no ficheiro 'data.txt' (escrever pouquinho 5 linhas max)
-                            file_path = r"C:\Users\35196\OneDrive\Ambiente de Trabalho\tese\Tese_code\SafeRoadside\shared\data.txt"
+
+                            file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "shared", "data.txt")
 
                             with open(file_path, "r", encoding="utf-8") as file:
                                 lines = file.readlines()
@@ -406,13 +557,14 @@ def main():
                                 with open(file_path, "a", encoding="utf-8") as file:
                                     file.write(f"{gps2hex(lat_deg, lon_deg)}\n")
 
-
             # 8) Exibição
             cv2.imshow("Tracking Inteligente", frame)
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
 
-    cv2.destroyAllWindows()
+    finally:
+        source.release()
+        cv2.destroyAllWindows()
 
 
 # -----------------------------------------------------------------------------

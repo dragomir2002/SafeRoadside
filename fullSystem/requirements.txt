@@ -1,0 +1,16 @@
+# Core dependencies
+numpy
+opencv-python
+
+# YOLO object detection
+ultralytics
+
+# Multi-object tracking
+deep-sort-realtime
+
+# Screen capture
+mss
+
+# Trajectory drawing UI
+pygame
+

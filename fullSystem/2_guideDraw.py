@@ -3,7 +3,6 @@ import numpy as np
 from mss import mss
 from ultralytics import YOLO
 from deep_sort_realtime.deepsort_tracker import DeepSort
-import pyautogui
 import os
 import random
 
@@ -11,9 +10,27 @@ import random
 model = YOLO("models/yolo11n.pt").to('cuda')
 tracker = DeepSort(max_age=1000, n_init=1, nn_budget=50, embedder_gpu=True)
 
-# Screen capture settings
-screen_width, screen_height = pyautogui.size()
-screen_region = {"top": 0, "left": 0, "width": screen_width, "height": screen_height}
+# Screen capture settings — let user pick which monitor
+sct_temp = mss()
+monitors = sct_temp.monitors
+print("\n============================================")
+print("  Available monitors:")
+print("============================================")
+for i, m in enumerate(monitors):
+    label = "ALL (virtual)" if i == 0 else f"Monitor {i}"
+    print(f"  {i}) {label}  —  {m['width']}x{m['height']}  at  ({m['left']}, {m['top']})")
+print("============================================")
+while True:
+    try:
+        choice = int(input(f"\nSelect monitor to capture [1-{len(monitors)-1}] (or 0 for all): "))
+        if 0 <= choice < len(monitors):
+            screen_region = monitors[choice]
+            print(f"[INFO] Capturing: {'ALL' if choice == 0 else f'Monitor {choice}'} ({screen_region['width']}x{screen_region['height']})")
+            break
+        else:
+            print(f"  Invalid. Choose 0 to {len(monitors)-1}.")
+    except (ValueError, EOFError):
+        print(f"  Invalid input.")
 
 # Dictionary to store tracked points
 point_history = {}

@@ -21,7 +21,10 @@ coords_str = [
     "41.940596°N 85.001059°W",
     "41.940886°N 85.000752°W",
     "41.940627°N 85.000731°W"
-]
+] # TODO abre uma imagem para por os pontos estas coornedas no mapa extamente e gerar map.txt, para ver as coorednadas extas poedmos ir ao google earth
+    # TODO ArUco markers para facilitar a seleção dos pontos (mas tem de ser na mesma ordem das coords_str)
+
+    # TODO trajetorias sao as vistas pelo sistemas/as desenhadas, ou seja caso um carro faca alguma coisa mal, o sistema nao o vai detetar
 
 
 
