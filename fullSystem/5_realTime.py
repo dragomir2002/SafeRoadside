@@ -13,6 +13,8 @@ import os
 import argparse
 import time
 
+from gateway_glue import start_gateway, publish as gw_publish
+
 # -----------------------------------------------------------------------------
 # CONFIGURAÇÃO DE LOGGING
 # -----------------------------------------------------------------------------
@@ -425,6 +427,8 @@ def main():
 
     print("[INFO] Starting detection loop... (press 'q' on the window to quit)")
 
+    start_gateway()
+
     try:
         while True:
             t0 = time.time()
@@ -496,6 +500,18 @@ def main():
 
                 # Atribui cor única
                 color = color_map.setdefault(track_id, get_random_color())
+
+                # Publish this track's GPS position to the SafeCorners gateway
+                try:
+                    _pt = np.array([[center[0]], [center[1]], [1]], dtype=np.float32)
+                    _XYW = homography_mat @ _pt
+                    _X, _Y, _W = _XYW[0, 0], _XYW[1, 0], _XYW[2, 0]
+                    if abs(_W) >= 1e-12:
+                        _X /= _W; _Y /= _W
+                        _lat, _lon = xy_to_latlon(_X, _Y, lat0_deg, lon0_deg)
+                        gw_publish(track_id, obj_class, _lat, _lon)
+                except Exception:
+                    pass  # never let gateway publishing break the detector
 
                 # Desenhar bounding box e label
                 cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)

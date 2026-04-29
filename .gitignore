@@ -1,2 +1,5 @@
 *.iml
 *.pt
+# SafeCorners gateway runtime artifacts
+gateway.jsonl
+__pycache__/
