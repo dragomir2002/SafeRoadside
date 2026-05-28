@@ -13,7 +13,7 @@ import os
 import argparse
 import time
 
-from gateway_glue import start_gateway, publish as gw_publish
+from gateway_glue import start_gateway, publish as gw_publish, start_safewalk_injector, start_safewalk_http_bridge
 
 # -----------------------------------------------------------------------------
 # CONFIGURAÇÃO DE LOGGING
@@ -213,7 +213,10 @@ def ekf(previous_points, prediction_range=5):
 # -----------------------------------------------------------------------------
 # 4) CONFIGURAÇÃO DE YOLO E DEEPSORT
 # -----------------------------------------------------------------------------
-model = YOLO("models/yolo11x.pt").to('cuda') # TODO é possivel alterar ete valor para outros modelos do YOLO
+import torch as _torch
+_DEVICE = "cuda" if _torch.cuda.is_available() else "cpu"
+print(f"[INFO] YOLO device: {_DEVICE}")
+model = YOLO("models/yolo11n.pt").to(_DEVICE) # TODO é possivel alterar ete valor para outros modelos do YOLO
 tracker = DeepSort( # TODO ver se ja outra versoes mais fortes do yolo
     max_age=1000,
     n_init=5,
@@ -428,6 +431,8 @@ def main():
     print("[INFO] Starting detection loop... (press 'q' on the window to quit)")
 
     start_gateway()
+    start_safewalk_injector()
+    start_safewalk_http_bridge()   # accepts POSTed PSMs on :8765, translates Lisbon -> video space
 
     try:
         while True:
@@ -507,7 +512,8 @@ def main():
                     _XYW = homography_mat @ _pt
                     _X, _Y, _W = _XYW[0, 0], _XYW[1, 0], _XYW[2, 0]
                     if abs(_W) >= 1e-12:
-                        _X /= _W; _Y /= _W
+                        _X /= _W
+                        _Y /= _W
                         _lat, _lon = xy_to_latlon(_X, _Y, lat0_deg, lon0_deg)
                         gw_publish(track_id, obj_class, _lat, _lon)
                 except Exception:
