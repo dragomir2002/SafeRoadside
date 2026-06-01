@@ -37,6 +37,22 @@ _print_pedestrian_gps = True  # toggled by start_gateway(verbose_pedestrians=...
 _safewalk_watcher_started = False
 INJECT_FILE = Path("/tmp/safewalk_inject.txt")
 
+# Latest SafeWalk position published, so the detector can render a marker.
+# Keyed by track_id -> (video_lat, video_lon, monotonic_ts).
+_latest_safewalk: dict = {}
+
+
+def get_latest_safewalk(max_age_s: float = 2.0) -> dict:
+    """Return {track_id: (lat, lon)} for SafeWalk phantoms seen within max_age_s.
+
+    The detector calls this each frame to draw "YOU" markers on the video.
+    Stale entries (no PSM in the last max_age_s seconds) are filtered out.
+    """
+    now = time.monotonic()
+    return {tid: (lat, lon)
+            for tid, (lat, lon, ts) in _latest_safewalk.items()
+            if now - ts <= max_age_s}
+
 
 def start_gateway(config_path: Optional[Path] = None,
                   run_id: Optional[str] = None) -> bool:
@@ -132,8 +148,13 @@ def publish(track_id, obj_class: str, lat: float, lon: float,
         print(f"[GW] pedestrian track {track_id} at lat={lat:.7f}, lon={lon:.7f}")
 
 
-def _publish_safewalk(lat: float, lon: float, track_id: str = "FAKE-PHONE") -> None:
-    """Inject one fake SafeWalk PSM (used by the inject-file watcher)."""
+_last_you_print = [0.0]  # mutable cell so the closure can update it
+
+
+def _publish_safewalk(lat: float, lon: float, track_id: str = "FAKE-PHONE",
+                       speed_mps: Optional[float] = None,
+                       heading_deg: Optional[float] = None) -> None:
+    """Inject one SafeWalk PSM (used by the inject-file watcher and HTTP bridge)."""
     if not _started or _adapter_getter is None:
         return
     try:
@@ -150,8 +171,8 @@ def _publish_safewalk(lat: float, lon: float, track_id: str = "FAKE-PHONE") -> N
         basic_type="pedestrian",
         lat=float(lat),
         lon=float(lon),
-        speed_mps=0.5,
-        heading_deg=None,
+        speed_mps=0.5 if speed_mps is None else float(speed_mps),
+        heading_deg=heading_deg if heading_deg is None else float(heading_deg),
         accuracy_m=10.0,
         confidence=0.85,
         t_sender=None,
@@ -167,6 +188,16 @@ def _publish_safewalk(lat: float, lon: float, track_id: str = "FAKE-PHONE") -> N
         except Exception:
             pass
     _loop.call_soon_threadsafe(_enqueue)
+    # Cache for the detector overlay: latest SafeWalk position per track_id.
+    _latest_safewalk[track_id] = (float(lat), float(lon), time.monotonic())
+    # Throttled "[YOU]" printout so the operator can see their own phantom
+    # tick alongside the detector's [GW] pedestrian lines. ~2 Hz max.
+    now = time.monotonic()
+    if now - _last_you_print[0] >= 0.5:
+        _last_you_print[0] = now
+        spd = "?" if speed_mps is None else f"{speed_mps:.1f}"
+        hdg = "?" if heading_deg is None else f"{heading_deg:.0f}"
+        print(f"[YOU] phone {track_id} @ video=({lat:.7f}, {lon:.7f})  spd={spd}m/s  hdg={hdg}deg")
 
 
 def start_safewalk_injector() -> None:
@@ -205,7 +236,9 @@ def start_safewalk_injector() -> None:
 
 def start_safewalk_http_bridge(host: str = "0.0.0.0", port: int = 8765,
                                video_anchor_lat: Optional[float] = None,
-                               video_anchor_lon: Optional[float] = None) -> None:
+                               video_anchor_lon: Optional[float] = None,
+                               force_heading_deg: Optional[float] = None,
+                               force_speed_mps: Optional[float] = None) -> None:
     """HTTP bridge: accept POSTed SafeWalk PSMs from the Windows scanner, translate
     real-world coords to video-anchor coords, and publish to the gateway.
 
@@ -219,6 +252,15 @@ def start_safewalk_http_bridge(host: str = "0.0.0.0", port: int = 8765,
     Result: walking 5 m east IRL moves the avatar 5 m east in the video frame.
 
     If no video anchor is given, defaults to the map.txt origin.
+
+    force_heading_deg / force_speed_mps:
+        For remote-testing demos: phone GPS heading reflects the real-world
+        street, not the video's street geometry. Set force_heading_deg=0 to
+        always report "pedestrian walking north across the road" (or whatever
+        direction puts you in collision course with traffic in the video).
+        Same idea for force_speed_mps if you want a stable demo trajectory.
+        In a production on-site deployment, leave both as None to use the
+        phone's real values.
     """
     if video_anchor_lat is None or video_anchor_lon is None:
         # default to map.txt origin
@@ -239,7 +281,17 @@ def start_safewalk_http_bridge(host: str = "0.0.0.0", port: int = 8765,
     import math
     R_EARTH = 6_371_000.0
 
-    def _translate(real_lat: float, real_lon: float) -> tuple[float, float]:
+    def _translate(real_lat: float, real_lon: float) -> tuple[float, float] | None:
+        # Reject obvious placeholder/no-GPS-lock packets. SafeWalk emits
+        # (12.34, 56.78) before its first GPS fix; a (0, 0) "Null Island"
+        # fix or any wildly-out-of-range coord is also bogus. Returning
+        # None makes the bridge drop the PSM instead of poisoning the
+        # home anchor or shoving the avatar miles off-frame.
+        if (abs(real_lat - 12.34) < 1e-3 and abs(real_lon - 56.78) < 1e-3) \
+           or (abs(real_lat) < 1e-6 and abs(real_lon) < 1e-6) \
+           or not (-90.0 <= real_lat <= 90.0) \
+           or not (-180.0 <= real_lon <= 180.0):
+            return None
         if home_lat[0] is None:
             home_lat[0] = real_lat
             home_lat.append(real_lon)  # store lon at index 1
@@ -270,8 +322,28 @@ def start_safewalk_http_bridge(host: str = "0.0.0.0", port: int = 8765,
                 real_lat = float(body["lat"])
                 real_lon = float(body["lon"])
                 tid = body.get("track_id", "PHONE")
-                video_lat, video_lon = _translate(real_lat, real_lon)
-                _publish_safewalk(video_lat, video_lon, tid)
+                spd = body.get("speed_mps")
+                hdg = body.get("heading_deg")
+                # Demo-mode overrides: pin heading/speed regardless of what
+                # the phone reports. Used when the phone is in a different
+                # geography than the video and its real heading wouldn't
+                # produce a meaningful TTC against the video's traffic.
+                if force_heading_deg is not None:
+                    hdg = float(force_heading_deg)
+                if force_speed_mps is not None:
+                    spd = float(force_speed_mps)
+                translated = _translate(real_lat, real_lon)
+                if translated is None:
+                    # Placeholder PSM (no GPS lock yet) -- accept the HTTP
+                    # request so the scanner doesn't retry-storm, but skip
+                    # publishing to the gateway.
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(b'{"ok":true,"skipped":"no_gps_lock"}')
+                    return
+                video_lat, video_lon = translated
+                _publish_safewalk(video_lat, video_lon, tid,
+                                  speed_mps=spd, heading_deg=hdg)
                 self.send_response(200)
                 self.end_headers()
                 self.wfile.write(b'{"ok":true}')

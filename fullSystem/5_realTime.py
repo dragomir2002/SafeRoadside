@@ -13,7 +13,7 @@ import os
 import argparse
 import time
 
-from gateway_glue import start_gateway, publish as gw_publish, start_safewalk_injector, start_safewalk_http_bridge
+from gateway_glue import start_gateway, publish as gw_publish, start_safewalk_injector, start_safewalk_http_bridge, get_latest_safewalk
 
 # -----------------------------------------------------------------------------
 # CONFIGURAÇÃO DE LOGGING
@@ -84,6 +84,15 @@ def xy_to_latlon(X, Y, lat0_deg, lon0_deg):
     lat_deg = math.degrees(lat)
     lon_deg = math.degrees(lon)
     return lat_deg, lon_deg
+
+
+def latlon_to_xy(lat_deg, lon_deg, lat0_deg, lon0_deg):
+    """Inverso de xy_to_latlon: (lat, lon) em graus -> (X, Y) em metros."""
+    R = 6371000.0
+    lat0 = math.radians(lat0_deg)
+    Y = math.radians(lat_deg - lat0_deg) * R
+    X = math.radians(lon_deg - lon0_deg) * R * math.cos(lat0)
+    return X, Y
 
 
 # -----------------------------------------------------------------------------
@@ -230,7 +239,13 @@ tracker = DeepSort( # TODO ver se ja outra versoes mais fortes do yolo
 # 5) CARREGAR MAPA (lat/lon + HOMOGRAFIA) E TRAJETÓRIAS
 # -----------------------------------------------------------------------------
 lat0_deg, lon0_deg, homography_mat = load_map_data("map.txt")
+homography_mat_inv = np.linalg.inv(homography_mat)  # for SafeWalk overlay
 predefined_trajectories = load_trajectories("trajetoriasClean.txt")
+
+# Cache of (last_lat, last_lon, last_t) per track_id, used to estimate
+# speed_mps + heading_deg from successive detector frames so the gateway's
+# TTC math has something to work with.
+gw_track_history: dict = {}
 
 # -----------------------------------------------------------------------------
 # 6) VARIÁVEIS GLOBAIS
@@ -432,7 +447,11 @@ def main():
 
     start_gateway()
     start_safewalk_injector()
-    start_safewalk_http_bridge()   # accepts POSTed PSMs on :8765, translates Lisbon -> video space
+    # Video anchor placed mid-road between the two sidewalks observed in the
+    # demo clip (tracks 68 and 72). Walking IRL now lands you between cars.
+    # Phone's real heading/speed are used as-is.
+    start_safewalk_http_bridge(video_anchor_lat=41.9407373,
+                               video_anchor_lon=-85.0010280)
 
     try:
         while True:
@@ -515,7 +534,26 @@ def main():
                         _X /= _W
                         _Y /= _W
                         _lat, _lon = xy_to_latlon(_X, _Y, lat0_deg, lon0_deg)
-                        gw_publish(track_id, obj_class, _lat, _lon)
+                        # Estimate speed_mps + heading_deg from successive frames.
+                        # gw_track_history caches (last_lat, last_lon, last_t) per
+                        # track_id; the gateway needs these to compute TTC.
+                        _now = time.time()
+                        _spd = None
+                        _hdg = None
+                        prev = gw_track_history.get(track_id)
+                        if prev is not None:
+                            _plat, _plon, _pt_ = prev
+                            _dt = _now - _pt_
+                            if 0.05 < _dt < 2.0:  # ignore jitter / stale
+                                _dnorth = math.radians(_lat - _plat) * 6_371_000.0
+                                _deast = math.radians(_lon - _plon) * 6_371_000.0 * math.cos(math.radians(_lat))
+                                _dist = math.hypot(_dnorth, _deast)
+                                _spd = _dist / _dt
+                                if _dist > 0.05:  # meaningful displacement
+                                    _hdg = (math.degrees(math.atan2(_deast, _dnorth)) + 360) % 360
+                        gw_track_history[track_id] = (_lat, _lon, _now)
+                        gw_publish(track_id, obj_class, _lat, _lon,
+                                   speed_mps=_spd, heading_deg=_hdg)
                 except Exception:
                     pass  # never let gateway publishing break the detector
 
@@ -578,6 +616,25 @@ def main():
                             if len(lines) < 5:
                                 with open(file_path, "a", encoding="utf-8") as file:
                                     file.write(f"{gps2hex(lat_deg, lon_deg)}\n")
+
+            # 7.5) SafeWalk avatar overlay -- draw "YOU" markers for any
+            # phone that has published a PSM in the last ~2 s. Maps lat/lon
+            # back through the inverse homography to a pixel coordinate.
+            try:
+                for sw_tid, (sw_lat, sw_lon) in get_latest_safewalk().items():
+                    sX, sY = latlon_to_xy(sw_lat, sw_lon, lat0_deg, lon0_deg)
+                    sxy = homography_mat_inv @ np.array([sX, sY, 1.0], dtype=np.float32)
+                    if abs(sxy[2]) > 1e-9:
+                        spx = int(sxy[0] / sxy[2])
+                        spy = int(sxy[1] / sxy[2])
+                        if 0 <= spx < frame.shape[1] and 0 <= spy < frame.shape[0]:
+                            cv2.circle(frame, (spx, spy), 18, (0, 255, 255), 3)
+                            cv2.circle(frame, (spx, spy), 4, (0, 255, 255), -1)
+                            cv2.putText(frame, f"YOU ({sw_tid})", (spx + 22, spy - 8),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                                        (0, 255, 255), 2, cv2.LINE_AA)
+            except Exception as _e:
+                pass  # never let overlay errors crash the detector
 
             # 8) Exibição
             cv2.imshow("Tracking Inteligente", frame)
