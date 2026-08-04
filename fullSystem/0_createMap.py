@@ -8,23 +8,41 @@ import math
 # Lista de 13 coordenadas lat/long em formato string.
 # Exemplo (modifica ou adapta às tuas coords):
 coords_str = [
-    "41.940499°N 85.000637°W",
-    "41.940649°N 85.000545°W",
-    "41.940856°N 85.000903°W",
-    "41.940538°N 85.000877°W",
-    "41.940767°N 85.000669°W",
-    "41.940483°N 85.000784°W",
-    "41.940757°N 85.000821°W",
-    "41.940666°N 85.000881°W",
-    "41.940614°N 85.000554°W",
-    "41.940768°N 85.001015°W",
-    "41.940596°N 85.001059°W",
-    "41.940886°N 85.000752°W",
-    "41.940627°N 85.000731°W"
+    "38.736407°N 9.143549°W",
+    "38.736401°N 9.143609°W",
+    "38.736482°N 9.143597°W",
+    "38.736467°N 9.143683°W",
+    "38.736401°N 9.143743°W",
+    "38.736392°N 9.143791°W",
+    "38.736465°N 9.143808°W",
+    "38.736386°N 9.143878°W",
+    "38.736288°N 9.143773°W",
+    "38.736242°N 9.143705°W",
+    "38.736297°N 9.143675°W",
+    "38.736290°N 9.143581°W",
+    "38.736348°N 9.143535°W"
 ] # TODO abre uma imagem para por os pontos estas coornedas no mapa extamente e gerar map.txt, para ver as coorednadas extas poedmos ir ao google earth
     # TODO ArUco markers para facilitar a seleção dos pontos (mas tem de ser na mesma ordem das coords_str)
 
     # TODO trajetorias sao as vistas pelo sistemas/as desenhadas, ou seja caso um carro faca alguma coisa mal, o sistema nao o vai detetar
+    
+"""
+    coords_str = [
+    "38.736407°N 9.143549°W",
+    "38.736401°N 9.143609°W",
+    "38.736482°N 9.143597°W",
+    "38.736467°N 9.143683°W",
+    "38.736401°N 9.143743°W",
+    "38.736392°N 9.143791°W",
+    "38.736465°N 9.143808°W",
+    "38.736386°N 9.143878°W",
+    "38.736288°N 9.143773°W",
+    "38.736242°N 9.143705°W",
+    "38.736297°N 9.143675°W",
+    "38.736290°N 9.143581°W",
+    "38.736348°N 9.143535°W"
+]
+"""
 
 
 
