@@ -19,6 +19,7 @@ detector still runs standalone.
 from __future__ import annotations
 
 import logging
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -35,7 +36,8 @@ _loop = None  # asyncio.AbstractEventLoop set on background thread
 _adapter_getter = None  # callable -> RsuAdapter
 _print_pedestrian_gps = True  # toggled by start_gateway(verbose_pedestrians=...)
 _safewalk_watcher_started = False
-INJECT_FILE = Path("/tmp/safewalk_inject.txt")
+# Platform temp dir: /tmp on Linux, the user's temp dir on Windows.
+INJECT_FILE = Path(tempfile.gettempdir()) / "safewalk_inject.txt"
 
 # Latest SafeWalk position published, so the detector can render a marker.
 # Keyed by track_id -> (video_lat, video_lon, monotonic_ts).
@@ -201,7 +203,7 @@ def _publish_safewalk(lat: float, lon: float, track_id: str = "FAKE-PHONE",
 
 
 def start_safewalk_injector() -> None:
-    """Start a background thread that watches /tmp/safewalk_inject.txt.
+    """Start a background thread that watches INJECT_FILE.
 
     Each line in the file is "lat lon [track_id]". As long as the file
     exists, we publish a SafeWalk observation at that coord every 0.5s.

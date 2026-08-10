@@ -69,7 +69,7 @@ python 5_realTime.py --source demo_video.mp4 --loop
 
 Look for these log lines:
 - `safecorners gateway started on background thread`
-- `safewalk inject watcher started (write to /tmp/safewalk_inject.txt)`
+- `safewalk inject watcher started (write to <temp>/safewalk_inject.txt)` — `/tmp` on Linux, the user temp dir on Windows
 - `safewalk HTTP bridge listening on 0.0.0.0:8765 (video anchor=41.940499, -85.000637)`
 - `[INFO] YOLO device: cpu` (or `cuda`)
 

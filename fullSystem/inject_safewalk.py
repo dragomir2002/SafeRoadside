@@ -13,18 +13,17 @@ Python process, because the gateway runs inside the detector's process.
 
 So this script CAN'T be a separate process.
 
-Workaround: this script just bumps a file `/tmp/safewalk_inject.txt`
-with "lat lon", and a tiny watcher thread inside the detector reads it
-and publishes. See gateway_glue.start_safewalk_injector() — call once
-near start_gateway().
+Workaround: this script just bumps the inject file with "lat lon", and a
+tiny watcher thread inside the detector reads it and publishes. See
+gateway_glue.start_safewalk_injector() — call once near start_gateway().
 """
 from __future__ import annotations
 import argparse
 import sys
 import time
-from pathlib import Path
 
-INJECT_FILE = Path("/tmp/safewalk_inject.txt")
+# Single source of truth for the path — must match the detector's watcher.
+from gateway_glue import INJECT_FILE
 
 
 def main() -> int:
