@@ -13,3 +13,6 @@ fullSystem/scenes/**/*.log
 # per-run gateway logs (regenerable; the eval harnesses read them)
 fullSystem/scenes/**/*.jsonl
 *.bak
+
+# Runtime BLE outbox: rewritten on every detector run, never source.
+shared/data.txt
