@@ -317,14 +317,23 @@ def _publish_safewalk(lat: float, lon: float, track_id: str = "FAKE-PHONE",
         return
     # Bypass the RSU-flavored convenience and push a peer Observation directly.
     try:
-        from safecorners_gateway.adapters.ble_in import _BASIC_TYPE_TO_INFO
-        _src, _btype = _BASIC_TYPE_TO_INFO.get(basic_type_b, ("SafeWalk", "pedestrian"))
+        from safecorners_gateway.adapters.ble_in import BASIC_TYPE_TO_INFO
+        _src, _btype = BASIC_TYPE_TO_INFO.get(basic_type_b, ("SafeWalk", "unknown"))
     except Exception:
         _src, _btype = "SafeWalk", "pedestrian"
     if source:
         _src = source
-    if _btype == "unknown":
-        _btype = "pedestrian"
+    # Deliberately NOT coerced to "pedestrian". Reporting an unrecognised
+    # basicType as a pedestrian is exactly the role fabrication that was
+    # removed from the BLE path: it puts a road user the sender never claimed
+    # into the VRU population, and every per-class figure then counts it.
+    #
+    # The cost is that an "unknown" observation is neither a VRU nor a vehicle
+    # to stages/associate.py, so it is dropped from pairing. That is the right
+    # trade -- and it is moot with today's senders, since SafeWalk only emits
+    # basicType 0/1 and SafeBike only 2. Should a sender ever use 3 (public
+    # safety worker) or 4 (animal), decide then what those are, rather than
+    # silently having decided already.
 
     _tsrc = time_source or "unknown"
     if t_sender_utc is None:
