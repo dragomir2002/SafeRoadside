@@ -68,6 +68,8 @@ _stats: dict = {
     # frames; against an unknown length it means a dialect it does not.
     "decode_errors": 0,
     "decode_error_len": {},   # str(payload length) -> count
+    # POSTs that decoded but could not become a valid Observation.
+    "inject_rejected": 0,
 }
 _stats_lock = threading.Lock()
 
@@ -132,6 +134,13 @@ def get_gateway_stats() -> dict:
         out["risk"] = dict(_stats["risk"])
         out["source_risk"] = {k: dict(v) for k, v in _stats["source_risk"].items()}
         out["decode_error_len"] = dict(_stats["decode_error_len"])
+        # last_fuse/safewalk are always rebound wholesale rather than mutated
+        # in place, so aliasing them is safe today -- copy anyway, so that a
+        # future in-place mutation cannot reintroduce the tearing this
+        # function exists to prevent.
+        for k in ("last_fuse", "safewalk"):
+            if isinstance(_stats.get(k), dict):
+                out[k] = dict(_stats[k])
         return out
 
 
@@ -288,6 +297,7 @@ def _publish_safewalk(lat: float, lon: float, track_id: str = "FAKE-PHONE",
                        accuracy_m: Optional[float] = None,
                        basic_type_b: int = 1,
                        source: Optional[str] = None,
+                       basic_type: Optional[str] = None,
                        t_sender_utc: Optional[float] = None,
                        time_source: Optional[str] = None,
                        radius_of_curve_m: Optional[float] = None,
@@ -323,6 +333,11 @@ def _publish_safewalk(lat: float, lon: float, track_id: str = "FAKE-PHONE",
         _src, _btype = "SafeWalk", "pedestrian"
     if source:
         _src = source
+    if basic_type:
+        # The scanner decoded the payload and knows the role; basicType cannot
+        # express "unknown" faithfully and means different things in the two
+        # dialects, so an explicit role wins when one is supplied.
+        _btype = basic_type
     # Deliberately NOT coerced to "pedestrian". Reporting an unrecognised
     # basicType as a pedestrian is exactly the role fabrication that was
     # removed from the BLE path: it puts a road user the sender never claimed
@@ -366,17 +381,25 @@ def _publish_safewalk(lat: float, lon: float, track_id: str = "FAKE-PHONE",
             path_confidence=path_confidence,
         )
     except ValueError as e:
-        # A malformed POST must not take down the bridge thread.
+        # A malformed POST must not take down the bridge thread -- but it must
+        # not vanish either. Before the guard existed this raised through to
+        # do_POST and the scanner saw HTTP 400; swallowing it silently traded a
+        # visible failure for an invisible one, which is the specific mistake
+        # that hid the SafeBike wire-format mismatch for the life of the
+        # project. Counted for the HUD, and do_POST reports it.
         log.warning("rejected injected PSM for %s: %s", track_id, e)
-        return
+        with _stats_lock:
+            _stats["inject_rejected"] += 1
+        return False
     if _loop is None:
-        return
+        return False
     def _enqueue() -> None:
         try:
             adapter.ingest_q.put_nowait(obs)
         except Exception:
             pass
     _loop.call_soon_threadsafe(_enqueue)
+    published = True
     # Cache for the detector overlay: latest SafeWalk position per track_id.
     _latest_safewalk[track_id] = (float(lat), float(lon), time.monotonic())
     # Fuller snapshot for the HUD: what the phone itself is reporting. Note the
@@ -401,6 +424,7 @@ def _publish_safewalk(lat: float, lon: float, track_id: str = "FAKE-PHONE",
         spd = "?" if speed_mps is None else f"{speed_mps:.1f}"
         hdg = "?" if heading_deg is None else f"{heading_deg:.0f}"
         print(f"[YOU] phone {track_id} @ video=({lat:.7f}, {lon:.7f})  spd={spd}m/s  hdg={hdg}deg")
+    return published
 
 
 def start_safewalk_injector() -> None:
@@ -537,6 +561,7 @@ def start_safewalk_http_bridge(host: str = "0.0.0.0", port: int = 8765,
                 # `source`, which is authoritative when present.
                 btype = int(body.get("basicType", 1))
                 src = body.get("source")
+                btype_name = body.get("basic_type")
                 # Sender clock. Previously dropped here, which demoted every
                 # bridged observation to time_source="unknown" even when the
                 # phone had populated it -- the same decode-then-discard
@@ -568,13 +593,21 @@ def start_safewalk_http_bridge(host: str = "0.0.0.0", port: int = 8765,
                     self.wfile.write(b'{"ok":true,"skipped":"no_gps_lock"}')
                     return
                 video_lat, video_lon = translated
-                _publish_safewalk(video_lat, video_lon, tid,
+                accepted = _publish_safewalk(video_lat, video_lon, tid,
                                   speed_mps=spd, heading_deg=hdg,
                                   accuracy_m=acc, basic_type_b=btype,
-                                  source=src,
+                                  source=src, basic_type=btype_name,
                                   t_sender_utc=t_sender_utc, time_source=tsrc,
                                   radius_of_curve_m=rcurve,
                                   path_confidence=pconf)
+                if accepted is False:
+                    # Decoded fine, but the values do not form a valid
+                    # Observation. 400 so the sender sees it, matching the
+                    # behaviour before the handler-thread guard was added.
+                    self.send_response(400)
+                    self.end_headers()
+                    self.wfile.write(b'{"error":"rejected: invalid observation"}')
+                    return
                 self.send_response(200)
                 self.end_headers()
                 self.wfile.write(b'{"ok":true}')
