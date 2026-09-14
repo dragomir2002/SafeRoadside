@@ -19,6 +19,7 @@ detector still runs standalone.
 from __future__ import annotations
 
 import logging
+import os
 import tempfile
 import threading
 import time
@@ -42,6 +43,107 @@ INJECT_FILE = Path(tempfile.gettempdir()) / "safewalk_inject.txt"
 # Latest SafeWalk position published, so the detector can render a marker.
 # Keyed by track_id -> (video_lat, video_lon, monotonic_ts).
 _latest_safewalk: dict = {}
+
+# Live pipeline counters for the detector's on-screen HUD. Fed by the observer
+# passed into run_gateway, so the HUD never has to tail gateway.jsonl.
+_stats: dict = {
+    "ingest_rsu": 0, "ingest_phone": 0,
+    "assoc_matched": 0, "assoc_unmatched": 0,
+    "fused": 0, "fused_coop": 0,
+    "dispatched": 0, "suppressed": 0,
+    "risk": {"low": 0, "probable": 0, "imminent": 0},
+    "last_risk": None, "last_ttc": None, "last_warn_t": 0.0,
+    "config": None,
+    "safewalk": None,    # latest PSM the phone sent (position/kinematics only)
+    "last_fuse": None,   # latest non-none fusion: risk, ttc, per-source conf
+    # Per-source: the risk of the most recent fusion this source fed into, so
+    # the HUD can colour each subsystem by the alarm IT is contributing to.
+    # Neither subsystem emits a risk of its own -- the PSM has no risk field
+    # and the RSU publishes raw tracks -- so this is "the risk this source is
+    # currently implicated in", not "the risk this source computed".
+    "source_risk": {},   # source -> {"risk": str, "t": float}
+    # PSM advertisements the gateway's own BLE scanner saw on the inbound
+    # manufacturer ID but could not decode, broken down by payload length.
+    # A non-zero count against a length the gateway does speak means corrupt
+    # frames; against an unknown length it means a dialect it does not.
+    "decode_errors": 0,
+    "decode_error_len": {},   # str(payload length) -> count
+}
+_stats_lock = threading.Lock()
+
+
+def _observe(rec: dict) -> None:
+    """Fold one gateway stage record into the HUD counters."""
+    stage = rec.get("stage")
+    with _stats_lock:
+        if stage == "ingest":
+            src = rec.get("source")
+            if src == "RSU":
+                _stats["ingest_rsu"] += 1
+            elif src:
+                _stats["ingest_phone"] += 1
+        elif stage == "associate":
+            _stats["assoc_matched" if rec.get("matched") else "assoc_unmatched"] += 1
+        elif stage == "fuse":
+            _stats["fused"] += 1
+            if len(set(rec.get("sources") or ())) > 1:
+                _stats["fused_coop"] += 1
+            if rec.get("risk") and rec["risk"] != "none":
+                for _src in set(rec.get("sources") or ()):
+                    _stats["source_risk"][_src] = {
+                        "risk": rec["risk"], "t": time.monotonic(),
+                    }
+                _stats["last_fuse"] = {
+                    "risk": rec.get("risk"),
+                    "ttc": rec.get("ttc"),
+                    "confidence": rec.get("confidence"),
+                    "source_confidence": rec.get("source_confidence") or {},
+                    "sources": sorted(set(rec.get("sources") or ())),
+                    "t": time.monotonic(),
+                }
+        elif stage == "ble_scanner":
+            # A phone advertising a dialect the gateway cannot parse used to
+            # produce no signal anywhere. Surfacing the count on the HUD means
+            # "the phone is right there and nothing is arriving" is visible at
+            # a glance instead of being inferred.
+            if rec.get("action") == "decode_error":
+                _stats["decode_errors"] += 1
+                n = str(rec.get("bytes"))
+                _stats["decode_error_len"][n] = _stats["decode_error_len"].get(n, 0) + 1
+        elif stage == "dispatch":
+            if rec.get("action") == "emitted":
+                _stats["dispatched"] += 1
+                r = rec.get("risk")
+                if r in _stats["risk"]:
+                    _stats["risk"][r] += 1
+                _stats["last_risk"] = r
+                _stats["last_warn_t"] = time.monotonic()
+            else:
+                _stats["suppressed"] += 1
+
+
+def get_gateway_stats() -> dict:
+    """Snapshot of the live pipeline counters (safe to call every frame)."""
+    with _stats_lock:
+        # Shallow copy plus an explicit copy of every nested container -- a
+        # caller iterating a live dict while the pipeline mutates it raises
+        # RuntimeError, and this is called every frame.
+        out = dict(_stats)
+        out["risk"] = dict(_stats["risk"])
+        out["source_risk"] = {k: dict(v) for k, v in _stats["source_risk"].items()}
+        out["decode_error_len"] = dict(_stats["decode_error_len"])
+        return out
+
+
+def set_verbose_pedestrians(enabled: bool) -> None:
+    """Toggle the per-pedestrian '[GW] pedestrian track N at lat=...' line.
+
+    It prints once per pedestrian per frame, which at a busy intersection
+    buries everything else in the console. The same information is on the
+    HUD and in gateway.jsonl.
+    """
+    global _print_pedestrian_gps
+    _print_pedestrian_gps = bool(enabled)
 
 
 def get_latest_safewalk(max_age_s: float = 2.0) -> dict:
@@ -82,6 +184,8 @@ def start_gateway(config_path: Optional[Path] = None,
 
     cfg = load_config(cfg_path)
     _adapter_getter = get_rsu_adapter
+    with _stats_lock:
+        _stats["config"] = cfg_path.name
 
     ready = threading.Event()
 
@@ -91,7 +195,8 @@ def start_gateway(config_path: Optional[Path] = None,
         _loop = loop
         asyncio.set_event_loop(loop)
         # Schedule the gateway, then signal readiness once the adapter exists.
-        gateway_task = loop.create_task(run_gateway(cfg, run_id=run_id))
+        gateway_task = loop.create_task(
+            run_gateway(cfg, run_id=run_id, observer=_observe))
 
         async def _wait_for_adapter() -> None:
             for _ in range(50):  # up to 5 s
@@ -153,35 +258,108 @@ def publish(track_id, obj_class: str, lat: float, lon: float,
 _last_you_print = [0.0]  # mutable cell so the closure can update it
 
 
+def _confidence_from_accuracy(accuracy_m: Optional[float]) -> float:
+    """Defer to the BLE-in adapter so both ingest paths share one curve."""
+    try:
+        from safecorners_gateway.adapters.ble_in import confidence_from_accuracy
+        return confidence_from_accuracy(accuracy_m)
+    except Exception:
+        return 0.6
+
+
+def _utc_from_sec_mark(sec_mark: int) -> Optional[float]:
+    """ms-within-the-minute -> absolute UTC, as the BLE-in adapter does it.
+
+    Only used for older scanners that post a bare `secMark`; a current scanner
+    posts `t_sender_utc` directly because it has already decoded the PSM.
+    """
+    if not sec_mark:
+        return None
+    try:
+        from safecorners_gateway.adapters.ble_in import _sender_utc_from_sec_mark
+        return _sender_utc_from_sec_mark(sec_mark, time.time())
+    except Exception:
+        return None
+
+
 def _publish_safewalk(lat: float, lon: float, track_id: str = "FAKE-PHONE",
                        speed_mps: Optional[float] = None,
-                       heading_deg: Optional[float] = None) -> None:
-    """Inject one SafeWalk PSM (used by the inject-file watcher and HTTP bridge)."""
+                       heading_deg: Optional[float] = None,
+                       accuracy_m: Optional[float] = None,
+                       basic_type_b: int = 1,
+                       source: Optional[str] = None,
+                       t_sender_utc: Optional[float] = None,
+                       time_source: Optional[str] = None,
+                       radius_of_curve_m: Optional[float] = None,
+                       path_confidence: Optional[float] = None) -> None:
+    """Inject one peer PSM (used by the inject-file watcher and HTTP bridge).
+
+    `source` is the producing app as the scanner's decoder determined it from
+    the payload dialect, and is authoritative when supplied. Falling back to
+    basic_type_b is weaker -- SafeWalk cannot emit a cyclist, so basicType
+    alone cannot really distinguish the two apps -- but it keeps older senders
+    working. This whole path used to hardcode SafeWalk/pedestrian, so a
+    cyclist over the HTTP bridge was silently relabelled a pedestrian and
+    SafeBike could never appear as a source here at all.
+
+    t_sender_utc / time_source carry the sender's own clock. The bridge used to
+    drop them and hardcode time_source="unknown", which demoted every
+    observation on this path to the lowest-confidence time regime of §4.4 --
+    even though the phone populates the field and the scanner forwards it. On
+    Windows this is the path that actually runs, so R2's primary clock was
+    unavailable exactly where it mattered.
+    """
     if not _started or _adapter_getter is None:
         return
     try:
         adapter = _adapter_getter()
     except RuntimeError:
         return
-    # Bypass the RSU-flavored convenience and push a SafeWalk Observation directly.
+    # Bypass the RSU-flavored convenience and push a peer Observation directly.
+    try:
+        from safecorners_gateway.adapters.ble_in import _BASIC_TYPE_TO_INFO
+        _src, _btype = _BASIC_TYPE_TO_INFO.get(basic_type_b, ("SafeWalk", "pedestrian"))
+    except Exception:
+        _src, _btype = "SafeWalk", "pedestrian"
+    if source:
+        _src = source
+    if _btype == "unknown":
+        _btype = "pedestrian"
+
+    _tsrc = time_source or "unknown"
+    if t_sender_utc is None:
+        # No usable sender clock, whatever the sender claimed.
+        _tsrc = "unknown"
     import uuid
     from safecorners_gateway.types import Observation
-    obs = Observation(
-        source="SafeWalk",
-        obs_id=uuid.uuid4().hex[:8],
-        track_id=track_id,
-        basic_type="pedestrian",
-        lat=float(lat),
-        lon=float(lon),
-        speed_mps=0.5 if speed_mps is None else float(speed_mps),
-        heading_deg=heading_deg if heading_deg is None else float(heading_deg),
-        accuracy_m=10.0,
-        confidence=0.85,
-        t_sender=None,
-        t_sender_utc=None,
-        time_source="unknown",
-        t_recv=time.monotonic(),
-    )
+    try:
+        obs = Observation(
+            source=_src,
+            obs_id=uuid.uuid4().hex[:8],
+            track_id=track_id,
+            basic_type=_btype,
+            lat=float(lat),
+            lon=float(lon),
+            speed_mps=0.5 if speed_mps is None else float(speed_mps),
+            heading_deg=heading_deg if heading_deg is None else float(heading_deg),
+            accuracy_m=accuracy_m,
+            # Same GNSS-accuracy -> confidence curve the BLE-in adapter uses, so a
+            # phone reaching the gateway over the HTTP bridge is weighted exactly
+            # as it would be over the radio. This used to be a flat 0.85 with a
+            # made-up 10 m accuracy, which silently discarded the one quality
+            # signal the PSM carries.
+            confidence=_confidence_from_accuracy(accuracy_m),
+            t_sender=None,
+            t_sender_utc=t_sender_utc,
+            time_source=_tsrc,
+            t_recv=time.monotonic(),
+            radius_of_curve_m=radius_of_curve_m,
+            path_confidence=path_confidence,
+        )
+    except ValueError as e:
+        # A malformed POST must not take down the bridge thread.
+        log.warning("rejected injected PSM for %s: %s", track_id, e)
+        return
     if _loop is None:
         return
     def _enqueue() -> None:
@@ -192,10 +370,24 @@ def _publish_safewalk(lat: float, lon: float, track_id: str = "FAKE-PHONE",
     _loop.call_soon_threadsafe(_enqueue)
     # Cache for the detector overlay: latest SafeWalk position per track_id.
     _latest_safewalk[track_id] = (float(lat), float(lon), time.monotonic())
+    # Fuller snapshot for the HUD: what the phone itself is reporting. Note the
+    # inbound PSM carries no risk field -- SafeWalk broadcasts position and
+    # kinematics only, and the risk verdict is the gateway's.
+    with _stats_lock:
+        _stats["safewalk"] = {
+            "source": _src,
+            "basic_type": _btype,
+            "track_id": track_id,
+            "lat": float(lat), "lon": float(lon),
+            "speed_mps": speed_mps, "heading_deg": heading_deg,
+            "accuracy_m": accuracy_m,
+            "confidence": _confidence_from_accuracy(accuracy_m),
+            "t": time.monotonic(),
+        }
     # Throttled "[YOU]" printout so the operator can see their own phantom
     # tick alongside the detector's [GW] pedestrian lines. ~2 Hz max.
     now = time.monotonic()
-    if now - _last_you_print[0] >= 0.5:
+    if _print_pedestrian_gps and now - _last_you_print[0] >= 0.5:
         _last_you_print[0] = now
         spd = "?" if speed_mps is None else f"{speed_mps:.1f}"
         hdg = "?" if heading_deg is None else f"{heading_deg:.0f}"
@@ -310,7 +502,7 @@ def start_safewalk_http_bridge(host: str = "0.0.0.0", port: int = 8765,
         out_lon = video_anchor_lon + math.degrees(deast / (R_EARTH * math.cos(math.radians(video_anchor_lat))))
         return out_lat, out_lon
 
-    from http.server import BaseHTTPRequestHandler, HTTPServer
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     import json as _json
 
     class _Handler(BaseHTTPRequestHandler):
@@ -326,6 +518,29 @@ def start_safewalk_http_bridge(host: str = "0.0.0.0", port: int = 8765,
                 tid = body.get("track_id", "PHONE")
                 spd = body.get("speed_mps")
                 hdg = body.get("heading_deg")
+                # GNSS accuracy ellipse (semi-major, metres). Drives the
+                # source confidence, so a degraded urban-canyon fix is
+                # weighted down rather than trusted like an open-sky one.
+                acc = body.get("accuracy_m")
+                # basicType decides SafeWalk-pedestrian vs SafeBike-cyclist,
+                # but only as a fallback: a scanner that decoded the payload
+                # knows which app sent it from the wire dialect and says so in
+                # `source`, which is authoritative when present.
+                btype = int(body.get("basicType", 1))
+                src = body.get("source")
+                # Sender clock. Previously dropped here, which demoted every
+                # bridged observation to time_source="unknown" even when the
+                # phone had populated it -- the same decode-then-discard
+                # failure as the accuracy field before it. `secMark` is still
+                # accepted from older scanners and reconstructed against
+                # gateway wall time the way the BLE adapter does it.
+                t_sender_utc = body.get("t_sender_utc")
+                tsrc = body.get("time_source")
+                if t_sender_utc is None and body.get("secMark"):
+                    t_sender_utc = _utc_from_sec_mark(int(body["secMark"]))
+                    tsrc = tsrc or "GPS"
+                rcurve = body.get("radius_of_curve_m")
+                pconf = body.get("path_confidence")
                 # Demo-mode overrides: pin heading/speed regardless of what
                 # the phone reports. Used when the phone is in a different
                 # geography than the video and its real heading wouldn't
@@ -345,7 +560,12 @@ def start_safewalk_http_bridge(host: str = "0.0.0.0", port: int = 8765,
                     return
                 video_lat, video_lon = translated
                 _publish_safewalk(video_lat, video_lon, tid,
-                                  speed_mps=spd, heading_deg=hdg)
+                                  speed_mps=spd, heading_deg=hdg,
+                                  accuracy_m=acc, basic_type_b=btype,
+                                  source=src,
+                                  t_sender_utc=t_sender_utc, time_source=tsrc,
+                                  radius_of_curve_m=rcurve,
+                                  path_confidence=pconf)
                 self.send_response(200)
                 self.end_headers()
                 self.wfile.write(b'{"ok":true}')
@@ -362,7 +582,14 @@ def start_safewalk_http_bridge(host: str = "0.0.0.0", port: int = 8765,
             self.wfile.write(f"safewalk bridge OK\nhome={home_str}\nvideo_anchor=({video_anchor_lat}, {video_anchor_lon})\n".encode())
 
     def _server() -> None:
-        srv = HTTPServer((host, port), _Handler)
+        # Threading, not plain HTTPServer. BLE re-advertises the same PSM
+        # several times a second and the scanner POSTs each sighting, so a
+        # single-threaded server serialises them: while one request is being
+        # handled the rest sit in the accept queue and blow the scanner's
+        # 0.5 s read timeout, which looks like "the bridge is down" when it
+        # is really just busy.
+        srv = ThreadingHTTPServer((host, port), _Handler)
+        srv.daemon_threads = True
         log.info("safewalk HTTP bridge listening on %s:%d (video anchor=%.6f, %.6f)",
                  host, port, video_anchor_lat, video_anchor_lon)
         srv.serve_forever()
@@ -381,11 +608,44 @@ def _basic_type_for(obj_class: str) -> Optional[str]:
 
 
 def _default_config_path() -> Path:
-    """Look for gateway.yaml in the SafeCorners-Gateway sibling folder.
-    Prefers gateway.demo.yaml if present (loosened thresholds for testing)."""
+    """Pick the gateway config, and say out loud which one was chosen.
+
+    gateway.demo.yaml loosens association so a demo still fires: radius 25 m
+    instead of 10, score threshold 0.2 instead of 0.6, and heading/speed
+    weights set to 0 so those terms are ignored entirely. That is useful for
+    showing the pipeline working, but it disables two of the four association
+    terms thesis 4.5 specifies, so numbers produced under it must not be
+    reported as evaluation results.
+
+    Selection order:
+      1. SAFECORNERS_GATEWAY_CONFIG   explicit path, always wins
+      2. gateway.yaml                 production thresholds (default)
+      3. gateway.demo.yaml            only via SAFECORNERS_GATEWAY_PROFILE=demo
+
+    This used to silently prefer the demo file whenever it existed, which made
+    it very easy to evaluate against loosened thresholds without noticing.
+    """
     here = Path(__file__).resolve()
     base = here.parents[2] / "SafeCorners-Gateway"
+
+    override = os.environ.get("SAFECORNERS_GATEWAY_CONFIG")
+    if override:
+        p = Path(override)
+        log.info("gateway config: %s (SAFECORNERS_GATEWAY_CONFIG)", p)
+        return p
+
+    profile = os.environ.get("SAFECORNERS_GATEWAY_PROFILE", "").lower()
     demo = base / "gateway.demo.yaml"
-    if demo.exists():
-        return demo
-    return base / "gateway.yaml"
+    if profile == "demo":
+        if demo.exists():
+            log.warning("gateway config: %s -- DEMO PROFILE, association is "
+                        "loosened (radius 25 m, score 0.2, heading/speed "
+                        "ignored). Do NOT report evaluation numbers from this.",
+                        demo)
+            return demo
+        log.warning("SAFECORNERS_GATEWAY_PROFILE=demo but %s not found; "
+                    "falling back to gateway.yaml", demo)
+
+    prod = base / "gateway.yaml"
+    log.info("gateway config: %s (production thresholds)", prod)
+    return prod

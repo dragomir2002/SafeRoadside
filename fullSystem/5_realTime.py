@@ -13,7 +13,10 @@ import os
 import argparse
 import time
 
-from gateway_glue import start_gateway, publish as gw_publish, start_safewalk_injector, start_safewalk_http_bridge, get_latest_safewalk
+from gateway_glue import (start_gateway, publish as gw_publish,
+                          start_safewalk_injector, start_safewalk_http_bridge,
+                          get_latest_safewalk, get_gateway_stats,
+                          set_verbose_pedestrians)
 
 # -----------------------------------------------------------------------------
 # CONFIGURAÇÃO DE LOGGING
@@ -238,9 +241,30 @@ tracker = DeepSort( # TODO ver se ja outra versoes mais fortes do yolo
 # -----------------------------------------------------------------------------
 # 5) CARREGAR MAPA (lat/lon + HOMOGRAFIA) E TRAJETÓRIAS
 # -----------------------------------------------------------------------------
-lat0_deg, lon0_deg, homography_mat = load_map_data("map.txt")
-homography_mat_inv = np.linalg.inv(homography_mat)  # for SafeWalk overlay
-predefined_trajectories = load_trajectories("trajetoriasClean.txt")
+# Populated in main() from --map / --trajectories. They are module-level
+# because the detection loop and the helpers below all read them as globals.
+lat0_deg = lon0_deg = None
+homography_mat = homography_mat_inv = None
+predefined_trajectories = []
+
+
+def load_scene(map_file="map.txt", traj_file="trajetoriasClean.txt"):
+    """Load the homography + reference trajectories for the active scene."""
+    global lat0_deg, lon0_deg, homography_mat, homography_mat_inv
+    global predefined_trajectories
+
+    lat0_deg, lon0_deg, homography_mat = load_map_data(map_file)
+    homography_mat_inv = np.linalg.inv(homography_mat)  # for SafeWalk overlay
+    print(f"[INFO] map '{map_file}': origin ({lat0_deg:.6f}, {lon0_deg:.6f})")
+
+    if os.path.exists(traj_file):
+        predefined_trajectories = load_trajectories(traj_file)
+        print(f"[INFO] {len(predefined_trajectories)} reference trajectories "
+              f"from '{traj_file}'")
+    else:
+        predefined_trajectories = []
+        print(f"[AVISO] '{traj_file}' not found - vehicle trajectory prediction "
+              f"is DISABLED (pedestrian EKF still runs)")
 
 # Cache of (last_lat, last_lon, last_t) per track_id, used to estimate
 # speed_mps + heading_deg from successive detector frames so the gateway's
@@ -254,11 +278,45 @@ color_map = {}
 point_history = {}
 missing_track_counter = {}
 
+# Pixel thresholds, expressed at the 1080p reference resolution they were
+# tuned on. calibrate_thresholds() rescales them once the true frame width is
+# known, so the same value means the same real-world distance at any
+# resolution. Without this a 4K scene halves every effective threshold.
+REFERENCE_WIDTH = 1920.0
 MIN_DISTANCE_THRESHOLD = 20
 COLLISION_THRESHOLD = 30
+TRAJ_SCORE_THRESHOLD = 3000
+
+# Multiplier for box thickness / font size / marker radii, so annotations stay
+# legible on a 4K frame instead of rendering hairline-thin.
+DRAW_SCALE = 1.0
+
+
+def calibrate_thresholds(frame_width, args):
+    """Scale the 1080p-tuned pixel thresholds to the actual frame width."""
+    global MIN_DISTANCE_THRESHOLD, COLLISION_THRESHOLD, TRAJ_SCORE_THRESHOLD
+    global DRAW_SCALE
+
+    k = frame_width / REFERENCE_WIDTH
+    DRAW_SCALE = max(1.0, k)
+    MIN_DISTANCE_THRESHOLD = (args.min_point_distance
+                              if args.min_point_distance is not None else 20 * k)
+    COLLISION_THRESHOLD = (args.collision_threshold
+                           if args.collision_threshold is not None else 30 * k)
+    TRAJ_SCORE_THRESHOLD = (args.traj_score_threshold
+                            if args.traj_score_threshold is not None else 3000 * k)
+    print(f"[INFO] frame width {frame_width}px -> threshold scale x{k:.2f}: "
+          f"min_point_dist={MIN_DISTANCE_THRESHOLD:.0f} "
+          f"collision={COLLISION_THRESHOLD:.0f} "
+          f"traj_score={TRAJ_SCORE_THRESHOLD:.0f}")
 
 vehicle_classes = ['car', 'truck', 'bus', 'motorcycle']
 pedestrian_class = 'person'
+# SafeBike's counterpart on the RSU side. YOLO labels the bicycle, not the
+# rider, so a cyclist usually also raises a 'person' track at the same spot;
+# both are VRUs and both are predicted with the EKF below.
+cyclist_classes = ['bicycle']
+vru_classes = [pedestrian_class] + cyclist_classes
 
 
 # -----------------------------------------------------------------------------
@@ -282,6 +340,62 @@ def parse_args():
     parser.add_argument(
         "--loop", action="store_true",
         help="Loop video file when it ends (only for --source video)"
+    )
+    # --- scene / resolution -------------------------------------------------
+    parser.add_argument(
+        "--map", type=str, default="map.txt",
+        help="Homography + origin file. Default map.txt"
+    )
+    parser.add_argument(
+        "--trajectories", type=str, default="trajetoriasClean.txt",
+        help="Cleaned reference trajectories. Default trajetoriasClean.txt"
+    )
+    parser.add_argument(
+        "--display-width", type=int, default=1600,
+        help="Downscale the preview window to this width (0 = native).\n"
+             "A 4K frame does not fit on screen; this only affects display."
+    )
+    parser.add_argument(
+        "--save-video", type=str, default=None,
+        help="Write the annotated output to this .mp4"
+    )
+    parser.add_argument(
+        "--no-display", action="store_true",
+        help="Run headless (no preview window)"
+    )
+    parser.add_argument(
+        "--quiet", action="store_true",
+        help="Silence the per-frame console chatter (per-pedestrian GPS lines, "
+             "library INFO logs). The on-screen HUD shows the same state, and "
+             "gateway.jsonl still records everything."
+    )
+    parser.add_argument(
+        "--no-hud", action="store_true",
+        help="Do not draw the status panel on the video"
+    )
+    parser.add_argument(
+        "--max-frames", type=int, default=0,
+        help="Stop after N frames (0 = run to the end). Useful for a quick check."
+    )
+    parser.add_argument(
+        "--no-gateway", action="store_true",
+        help="Skip the SafeCorners fusion gateway / SafeWalk bridge and run\n"
+             "the pure computer-vision pipeline only"
+    )
+    # Pixel thresholds below were tuned on 1080p. They are multiplied by
+    # (frame_width / 1920) at runtime so a 4K scene behaves the same in
+    # METRES as a 1080p one. Pass a value to pin it instead.
+    parser.add_argument(
+        "--collision-threshold", type=float, default=None,
+        help="Pixel distance for a predicted collision (default: 30 @1080p, scaled)"
+    )
+    parser.add_argument(
+        "--traj-score-threshold", type=float, default=None,
+        help="Trajectory-match score cutoff (default: 3000 @1080p, scaled)"
+    )
+    parser.add_argument(
+        "--min-point-distance", type=float, default=None,
+        help="Min pixel gap between stored track points (default: 20 @1080p, scaled)"
     )
     return parser.parse_args()
 
@@ -308,6 +422,11 @@ class VideoSource:
             if not ret:
                 return None
         return frame
+
+    def progress(self):
+        """(current frame, total frames) so the HUD can show position."""
+        return (int(self.cap.get(cv2.CAP_PROP_POS_FRAMES)),
+                int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT)))
 
     def release(self):
         self.cap.release()
@@ -419,12 +538,93 @@ def gps2hex(lat: float, lon: float) -> str:
     
     return f"{lat_hex} {lon_hex}"
 
+HDR = 1.35   # section headers are this much bigger than detail lines
+
+
+def _source_colour(stats, source, now_m, fallback, window_s=3.0):
+    """Colour a subsystem block by the risk of the fusion it just fed.
+
+    Neither subsystem emits a risk of its own -- the PSM has no risk field and
+    the RSU publishes raw tracks -- so this shows the alarm the source is
+    currently implicated in. Falls back to its liveness colour when it has not
+    contributed recently.
+    """
+    sr = (stats.get("source_risk") or {}).get(source)
+    if sr and (now_m - sr.get("t", 0.0)) < window_s:
+        return _RISK_COLOR.get(sr.get("risk"), fallback), sr.get("risk")
+    return fallback, None
+
+
+def _fmt(v, unit=""):
+    """Format an optional numeric field; PSM sentinels arrive as None."""
+    return "?" if v is None else f"{v:.2f}{unit}"
+
+
+_RISK_COLOR = {
+    "imminent": (0, 0, 255),      # red
+    "probable": (0, 140, 255),    # orange
+    "low":      (0, 220, 220),    # yellow
+    None:       (180, 180, 180),  # grey - nothing dispatched yet
+}
+
+
+def draw_hud(frame, lines, scale=1.0):
+    """Draw a translucent status panel in the top-left corner.
+
+    Each entry of `lines` is (text, colour) or (text, colour, size_mult).
+    size_mult scales that line's font, so section headers can be bigger than
+    their detail lines. Kept deliberately compact: the console is unusable for
+    watching a run because the gateway logs several lines per frame, so this
+    panel is the thing you actually watch.
+    """
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    base_fs = 0.55 * scale
+    pad = int(10 * scale)
+
+    # Measure first: line heights vary now, so the panel has to be sized from
+    # the actual text rather than a fixed per-line constant.
+    rows = []
+    total_h = pad
+    max_w = 0
+    for entry in lines:
+        text, colour = entry[0], entry[1]
+        mult = entry[2] if len(entry) > 2 else 1.0
+        fs = base_fs * mult
+        th = max(1, int(round(1.2 * scale * mult)))
+        (tw, _), _ = cv2.getTextSize(text or " ", font, fs, th)
+        lh = int(26 * scale * mult)
+        rows.append((text, colour, fs, th, lh))
+        total_h += lh
+        max_w = max(max_w, tw)
+
+    w = max_w + 2 * pad
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (pad, pad), (pad + w, pad + total_h), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
+    cv2.rectangle(frame, (pad, pad), (pad + w, pad + total_h),
+                  (90, 90, 90), max(1, int(scale)))
+
+    y = pad
+    for text, colour, fs, th, lh in rows:
+        y += lh
+        if text:
+            cv2.putText(frame, text, (pad * 2, y - int(6 * scale)),
+                        font, fs, colour, th, cv2.LINE_AA)
+
+
 def get_random_color():
     """Gera uma cor aleatória em formato BGR."""
     return (random.randint(0, 255), random.randint(0, 255), random.randint(0, 255))
 
-def is_point_far_enough(new_point, last_point, threshold=MIN_DISTANCE_THRESHOLD):
-    """Verifica se a distância entre dois pontos é maior que 'threshold'."""
+def is_point_far_enough(new_point, last_point, threshold=None):
+    """Verifica se a distância entre dois pontos é maior que 'threshold'.
+
+    threshold defaults to the *current* MIN_DISTANCE_THRESHOLD. It must be
+    read at call time, not bound as a default argument, because
+    calibrate_thresholds() rewrites it after the first frame is known.
+    """
+    if threshold is None:
+        threshold = MIN_DISTANCE_THRESHOLD
     return np.linalg.norm(np.array(new_point) - np.array(last_point)) > threshold
 
 
@@ -443,15 +643,31 @@ def main():
     # YOLO inference size (smaller = faster). Original frame kept for display.
     INFER_WIDTH = 1920
 
+    writer = None          # lazily created once the frame size is known
+    calibrated = False     # thresholds rescaled on the first frame
+
+    if args.quiet:
+        # The gateway and its libraries log several lines per frame; at a busy
+        # intersection that makes the console useless for watching a run.
+        set_verbose_pedestrians(False)
+        logging.getLogger("safecorners_gateway").setLevel(logging.WARNING)
+        logging.getLogger("deep_sort_realtime").setLevel(logging.WARNING)
+        logging.getLogger("gateway_glue").setLevel(logging.INFO)
+
+    load_scene(args.map, args.trajectories)
+
     print("[INFO] Starting detection loop... (press 'q' on the window to quit)")
 
-    start_gateway()
-    start_safewalk_injector()
-    # Video anchor placed mid-road between the two sidewalks observed in the
-    # demo clip (tracks 68 and 72). Walking IRL now lands you between cars.
-    # Phone's real heading/speed are used as-is.
-    start_safewalk_http_bridge(video_anchor_lat=41.9407373,
-                               video_anchor_lon=-85.0010280)
+    if args.no_gateway:
+        print("[INFO] gateway disabled (--no-gateway) - CV pipeline only")
+    else:
+        start_gateway()
+        start_safewalk_injector()
+        # Anchor the SafeWalk avatar on THIS scene's origin. It used to be
+        # pinned to the Michigan demo clip (41.9407, -85.0010), which put the
+        # avatar ~7000 km away from any non-demo scene and killed fusion.
+        start_safewalk_http_bridge(video_anchor_lat=lat0_deg,
+                                   video_anchor_lon=lon0_deg)
 
     try:
         while True:
@@ -464,6 +680,17 @@ def main():
                 break
 
             orig_h, orig_w = frame.shape[:2]
+
+            # 1.5) Rescale the 1080p-tuned pixel thresholds to this resolution
+            if not calibrated:
+                calibrate_thresholds(orig_w, args)
+                calibrated = True
+                if args.save_video:
+                    writer = cv2.VideoWriter(
+                        args.save_video,
+                        cv2.VideoWriter_fourcc(*"mp4v"),
+                        30.0, (orig_w, orig_h))
+                    print(f"[INFO] writing annotated video -> {args.save_video}")
 
             # 2) Resize for YOLO inference if frame is too large
             if orig_w > INFER_WIDTH:
@@ -496,7 +723,9 @@ def main():
 
             # Listas para armazenar predições futuras
             future_car_points = []
-            future_person_points = []
+            future_vru_points = []   # pedestrians AND cyclists
+            n_vehicles = n_vrus = 0  # this frame, for the HUD
+            n_collisions = 0
 
             # 5) Processar cada track
             for track in tracks:
@@ -558,41 +787,47 @@ def main():
                     pass  # never let gateway publishing break the detector
 
                 # Desenhar bounding box e label
-                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                _t = max(2, int(2 * DRAW_SCALE))
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, _t)
                 cv2.putText(
                     frame,
                     f"{obj_class} #{track_id}",
-                    (x1, y1 - 10),
+                    (x1, y1 - int(10 * DRAW_SCALE)),
                     cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5,
+                    0.5 * DRAW_SCALE,
                     color,
-                    2
+                    _t
                 )
 
                 # 6) Gera predições futuras
                 if obj_class in vehicle_classes:
+                    n_vehicles += 1
                     past_points = list(point_history[track_id])[-20:]
-                    best_traj = find_best_trajectory(past_points, predefined_trajectories, max_points=50)
+                    best_traj = find_best_trajectory(
+                        past_points, predefined_trajectories, max_points=50,
+                        score_threshold=TRAJ_SCORE_THRESHOLD)
                     for pt in best_traj:
-                        cv2.circle(frame, (int(pt[0]), int(pt[1])), 5, color, -1)
+                        cv2.circle(frame, (int(pt[0]), int(pt[1])), max(5, int(5 * DRAW_SCALE)), color, -1)
                     future_car_points.extend(best_traj)
 
-                elif obj_class == pedestrian_class:
+                elif obj_class in vru_classes:
+                    n_vrus += 1
                     past_points = list(point_history[track_id])[-10:]
                     pred_points = ekf(past_points, prediction_range=5)
                     for pt in pred_points:
-                        cv2.circle(frame, (int(pt[0]), int(pt[1])), 5, color, -1)
-                    future_person_points.extend(pred_points)
+                        cv2.circle(frame, (int(pt[0]), int(pt[1])), max(5, int(5 * DRAW_SCALE)), color, -1)
+                    future_vru_points.extend(pred_points)
 
             # 7) DETECTAR POSSÍVEIS COLISÕES (EM PIXEL) E CONVERTER P/ GPS
             for car_pt in future_car_points:
-                for person_pt in future_person_points:
+                for person_pt in future_vru_points:
                     dist = np.linalg.norm(np.array(car_pt) - np.array(person_pt))
                     if dist < COLLISION_THRESHOLD:
                         Px = int((car_pt[0] + person_pt[0]) / 2)
                         Py = int((car_pt[1] + person_pt[1]) / 2)
 
-                        cv2.circle(frame, (Px, Py), 20, (0, 0, 255), -1)
+                        n_collisions += 1
+                        cv2.circle(frame, (Px, Py), max(20, int(20 * DRAW_SCALE)), (0, 0, 255), -1)
 
                         pt = np.array([[Px], [Py], [1]], dtype=np.float32)
                         XYW = homography_mat @ pt
@@ -605,17 +840,36 @@ def main():
                             Y /= W
                             lat_deg, lon_deg = xy_to_latlon(X, Y, lat0_deg, lon0_deg)
 
-                            print(f"[ALERTA] Possível colisão futura em pixel=({Px},{Py}) "
-                                  f"-> lat/lon=({lat_deg:.6f}, {lon_deg:.6f})")
+                            if not args.quiet:
+                                # One line per conflicting point pair per frame:
+                                # unreadable at a busy intersection. The HUD
+                                # shows the live count, gateway.jsonl keeps all.
+                                print(f"[ALERTA] Possível colisão futura em pixel=({Px},{Py}) "
+                                      f"-> lat/lon=({lat_deg:.6f}, {lon_deg:.6f})")
 
+                            # shared/data.txt is the BLE sender's outbox. It is
+                            # capped at 5 pending alerts; a stale full file from
+                            # a previous run silently swallows every new alert,
+                            # so say so rather than failing quietly.
                             file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "shared", "data.txt")
 
-                            with open(file_path, "r", encoding="utf-8") as file:
-                                lines = file.readlines()
+                            try:
+                                if os.path.exists(file_path):
+                                    with open(file_path, "r", encoding="utf-8") as file:
+                                        lines = [l for l in file.readlines() if l.strip()]
+                                else:
+                                    lines = []
 
-                            if len(lines) < 5:
-                                with open(file_path, "a", encoding="utf-8") as file:
-                                    file.write(f"{gps2hex(lat_deg, lon_deg)}\n")
+                                if len(lines) < 5:
+                                    with open(file_path, "a", encoding="utf-8") as file:
+                                        file.write(f"{gps2hex(lat_deg, lon_deg)}\n")
+                                elif not getattr(main, "_outbox_warned", False):
+                                    print(f"[AVISO] {file_path} already holds 5 "
+                                          f"pending alerts - new alerts are NOT "
+                                          f"being written. Clear it to re-enable.")
+                                    main._outbox_warned = True
+                            except OSError as e:
+                                print(f"[AVISO] could not update {file_path}: {e}")
 
             # 7.5) SafeWalk avatar overlay -- draw "YOU" markers for any
             # phone that has published a PSM in the last ~2 s. Maps lat/lon
@@ -628,21 +882,138 @@ def main():
                         spx = int(sxy[0] / sxy[2])
                         spy = int(sxy[1] / sxy[2])
                         if 0 <= spx < frame.shape[1] and 0 <= spy < frame.shape[0]:
-                            cv2.circle(frame, (spx, spy), 18, (0, 255, 255), 3)
-                            cv2.circle(frame, (spx, spy), 4, (0, 255, 255), -1)
-                            cv2.putText(frame, f"YOU ({sw_tid})", (spx + 22, spy - 8),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                                        (0, 255, 255), 2, cv2.LINE_AA)
+                            cv2.circle(frame, (spx, spy), max(18, int(18 * DRAW_SCALE)), (0, 255, 255), max(3, int(3 * DRAW_SCALE)))
+                            cv2.circle(frame, (spx, spy), max(4, int(4 * DRAW_SCALE)), (0, 255, 255), -1)
+                            cv2.putText(frame, f"YOU ({sw_tid})",
+                                        (spx + int(22 * DRAW_SCALE), spy - int(8 * DRAW_SCALE)),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.7 * DRAW_SCALE,
+                                        (0, 255, 255), max(2, int(2 * DRAW_SCALE)), cv2.LINE_AA)
             except Exception as _e:
                 pass  # never let overlay errors crash the detector
 
+            # 7.6) HUD -- the console prints several gateway lines per frame,
+            # so this panel is what you actually watch a run on.
+            if not args.no_hud:
+                st = get_gateway_stats()
+                phones = get_latest_safewalk()
+                now_m = time.monotonic()
+
+                idx, total = source.progress() if hasattr(source, "progress") else (frame_count, 0)
+                pos = f"{idx}/{total}" if total else f"{frame_count}"
+                cfg_name = st["config"] or "standalone"
+                cfg_col = (0, 165, 255) if "demo" in cfg_name else (200, 200, 200)
+
+                WHITE, DIM = (255, 255, 255), (165, 165, 165)
+                lines = [
+                    (f"SafeCorners  {pos}   {fps:.1f} fps   [{cfg_name}]", WHITE),
+                    ("", DIM),
+                ]
+
+                # --- what SafeWalk is reporting -----------------------------
+                sw = st.get("safewalk")
+                fz = (st.get("last_fuse") or {}).get("source_confidence") or {}
+                if sw and (now_m - sw["t"]) < 5.0:
+                    age_s = now_m - sw["t"]
+                    live = age_s < 2.0
+                    scol = (0, 255, 0) if live else (0, 200, 255)
+                    # Confidence as the fusion actually used it (freshness
+                    # weighted) if this source fed the last decision; otherwise
+                    # the raw GNSS-accuracy confidence the PSM earns on its own.
+                    # Which peer app this is -- SafeWalk (pedestrian) or
+                    # SafeBike (cyclist). Driven by the PSM's basicType, not
+                    # assumed, so a cyclist shows up as SafeBike.
+                    sw_src = sw.get("source") or "SafeWalk"
+                    swc = fz.get(sw_src)
+                    own = sw.get("confidence")
+                    sw_col, sw_risk = _source_colour(st, sw_src, now_m, scol)
+                    lines += [
+                        (f"{sw_src.upper()}  {sw['track_id']}"
+                         + f"  ({sw.get('basic_type', 'pedestrian')})"
+                         + (f"   conf {swc:.2f}" if swc is not None
+                            else (f"   conf {own:.2f}" if own is not None else ""))
+                         + (f"   [{sw_risk.upper()}]" if sw_risk else ""),
+                         sw_col, HDR),
+                        (f"  says : {sw['lat']:.6f}, {sw['lon']:.6f}", scol),
+                        (f"         spd {_fmt(sw['speed_mps'], 'm/s')}"
+                         f"  hdg {_fmt(sw['heading_deg'], 'deg')}"
+                         f"   {age_s:.1f}s ago", scol),
+                        (f"  GNSS acc {_fmt(sw.get('accuracy_m'), 'm')}"
+                         + (f"  -> own conf {own:.2f}" if own is not None else ""), scol),
+                        ("  (PSM carries no risk -- position only)", DIM),
+                    ]
+                else:
+                    lines += [("SAFEWALK / SAFEBIKE  absent -- RSU only", DIM, HDR)]
+                lines.append(("", DIM))
+
+                # --- what the RSU is reporting ------------------------------
+                rsuc = fz.get("RSU")
+                rsu_col, rsu_risk = _source_colour(st, "RSU", now_m, WHITE)
+                lines += [
+                    ("RSU (camera)"
+                     + (f"   conf {rsuc:.2f}" if rsuc is not None else "")
+                     + (f"   [{rsu_risk.upper()}]" if rsu_risk else ""),
+                     rsu_col, HDR),
+                    (f"  sees : {n_vehicles} vehicles  {n_vrus} VRUs"
+                     f"  conflicts {n_collisions}", WHITE),
+                    (f"  gw   : {st['assoc_matched']} assoc  {st['fused']} fused"
+                     f"  ({st['fused_coop']} coop)", WHITE),
+                    ("", DIM),
+                ]
+
+                # --- the fused verdict --------------------------------------
+                lf = st.get("last_fuse")
+                risk = st["last_risk"]
+                wage = now_m - st["last_warn_t"] if st["last_warn_t"] else None
+                if lf and risk and wage is not None and wage < 3.0:
+                    rcol = _RISK_COLOR.get(risk, WHITE)
+                    ttc = lf.get("ttc")
+                    conf = lf.get("confidence")
+                    lines += [
+                        (f"GATEWAY SAYS : {risk.upper()}"
+                         + (f"   conf {conf:.2f}" if conf is not None else ""),
+                         rcol, HDR),
+                        (f"  TTC {ttc:.1f}s" if isinstance(ttc, (int, float))
+                         else "  TTC --", rcol),
+                        (f"  from {' + '.join(lf.get('sources') or ['?'])}"
+                         f"   ({wage:.1f}s ago)", rcol),
+                    ]
+                else:
+                    lines += [("GATEWAY SAYS : no active warning",
+                               _RISK_COLOR[None], HDR)]
+                lines.append((f"  totals: {st['dispatched']} sent   "
+                              f"L{st['risk']['low']} P{st['risk']['probable']} "
+                              f"I{st['risk']['imminent']}", DIM))
+
+                draw_hud(frame, lines, scale=DRAW_SCALE)
+
             # 8) Exibição
-            cv2.imshow("Tracking Inteligente", frame)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
+            if writer is not None:
+                writer.write(frame)
+
+            if not args.no_display:
+                disp = frame
+                if args.display_width and orig_w > args.display_width:
+                    s = args.display_width / orig_w
+                    disp = cv2.resize(frame, (args.display_width, int(orig_h * s)))
+                cv2.imshow("Tracking Inteligente", disp)
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
+
+            frame_count += 1
+            if args.max_frames and frame_count >= args.max_frames:
+                print(f"[INFO] reached --max-frames {args.max_frames}")
                 break
+            if frame_count % 50 == 0:
+                elapsed = time.time() - fps_start
+                fps = frame_count / elapsed if elapsed > 0 else 0.0
+                print(f"[INFO] {frame_count} frames processed "
+                      f"({fps:.1f} fps average)", flush=True)
 
     finally:
         source.release()
+        if writer is not None:
+            writer.release()
+            print(f"[OK] annotated video saved -> {args.save_video}")
         cv2.destroyAllWindows()
 
 
@@ -651,3 +1022,17 @@ def main():
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
     main()
+
+    # The gateway owns two daemon threads that block forever by design: an
+    # asyncio loop in run_forever() and the SafeWalk bridge in serve_forever().
+    # Neither unwinds at interpreter shutdown, and killing them mid-teardown
+    # made the process report exit 255 even on a fully successful run -- which
+    # breaks any script or CI step that checks the exit code.
+    #
+    # Nothing is lost by exiting hard here: main() has already released the
+    # video writer, and the gateway's JSONL log is opened line-buffered
+    # (buffering=1), so every record is on disk as it is written. Flush our own
+    # streams first, then go.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
