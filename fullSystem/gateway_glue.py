@@ -34,6 +34,10 @@ _CYCLIST_CLASSES = {"bicycle"}
 
 _started = False
 _loop = None  # asyncio.AbstractEventLoop set on background thread
+# The gateway's duration clock. start_gateway(clock=...) replaces it with a
+# replay clock for recorded footage, so every t_recv stamped here -- RSU tracks
+# and bridged phones alike -- is on the same time base the gateway reads.
+_clock = time.monotonic
 _adapter_getter = None  # callable -> RsuAdapter
 _print_pedestrian_gps = True  # toggled by start_gateway(verbose_pedestrians=...)
 _safewalk_watcher_started = False
@@ -168,15 +172,21 @@ def get_latest_safewalk(max_age_s: float = 2.0) -> dict:
 
 
 def start_gateway(config_path: Optional[Path] = None,
-                  run_id: Optional[str] = None) -> bool:
+                  run_id: Optional[str] = None, clock=None) -> bool:
     """Spin up the gateway on a daemon thread. Returns True on success.
 
     Safe to call multiple times — subsequent calls are no-ops.
-    Returns False (and logs) if the gateway package isn't installed.
+    Returns False (and logs) if the gateway package isn't installed, or if the
+    gateway did not come up.
+
+    clock: the duration clock for the whole pipeline. Pass a replay clock for
+    recorded footage (scene time); None keeps time.monotonic for live capture.
     """
-    global _started, _loop, _adapter_getter
+    global _started, _loop, _adapter_getter, _clock
     if _started:
         return True
+    if clock is not None:
+        _clock = clock
 
     try:
         import asyncio
@@ -205,7 +215,7 @@ def start_gateway(config_path: Optional[Path] = None,
         asyncio.set_event_loop(loop)
         # Schedule the gateway, then signal readiness once the adapter exists.
         gateway_task = loop.create_task(
-            run_gateway(cfg, run_id=run_id, observer=_observe))
+            run_gateway(cfg, run_id=run_id, observer=_observe, clock=clock))
 
         async def _wait_for_adapter() -> None:
             for _ in range(50):  # up to 5 s
@@ -215,7 +225,10 @@ def start_gateway(config_path: Optional[Path] = None,
                     return
                 except RuntimeError:
                     await asyncio.sleep(0.1)
-            ready.set()  # give up; publish() will degrade
+            # Do NOT signal ready: that used to mark the gateway started with no
+            # adapter, after which every publish() returned silently and the
+            # detector ran a whole trial blind.
+            log.error("gateway adapter never appeared; %r", gateway_task)
 
         loop.create_task(_wait_for_adapter())
         try:
@@ -234,11 +247,39 @@ def start_gateway(config_path: Optional[Path] = None,
     return True
 
 
+def wait_gateway_idle(timeout: float = 60.0) -> bool:
+    """Block the detector until the gateway has processed everything published.
+
+    Used once per frame on recorded footage (lock-step replay): the replay
+    clock must not advance while the gateway is still working through earlier
+    frames, or observation ages -- and TTCs -- depend on host timing.
+    Returns False (and logs) if the gateway is not running or never drains.
+    """
+    if not _started or _loop is None:
+        return False
+    try:
+        import asyncio
+        from safecorners_gateway.main import wait_idle
+        ok = asyncio.run_coroutine_threadsafe(wait_idle(), _loop).result(timeout=timeout)
+    except Exception as e:
+        log.error("waiting for the gateway to drain failed: %r", e)
+        return False
+    if not ok:
+        log.error("gateway queues did not drain")
+    return ok
+
+
 def publish(track_id, obj_class: str, lat: float, lon: float,
             confidence: float = 0.85,
             speed_mps: Optional[float] = None,
-            heading_deg: Optional[float] = None) -> None:
-    """Publish one detector track to the gateway. No-op if gateway isn't running."""
+            heading_deg: Optional[float] = None,
+            t_recv: Optional[float] = None) -> None:
+    """Publish one detector track to the gateway. No-op if gateway isn't running.
+
+    t_recv: the frame's capture time on the gateway clock. The detector passes
+    one value for every track of a frame; stamping each track as it is
+    published spread one camera instant over ~77 ms and across buffer flushes.
+    """
     if not _started or _adapter_getter is None:
         return
     basic_type = _basic_type_for(obj_class)
@@ -258,7 +299,7 @@ def publish(track_id, obj_class: str, lat: float, lon: float,
         "accuracy_m":  None,
         "confidence":  float(confidence),
         "t_sender":    None,
-        "t_recv":      time.monotonic(),
+        "t_recv":      _clock() if t_recv is None else float(t_recv),
     })
     if _print_pedestrian_gps and basic_type == "pedestrian":
         print(f"[GW] pedestrian track {track_id} at lat={lat:.7f}, lon={lon:.7f}")
@@ -364,7 +405,9 @@ def _publish_safewalk(lat: float, lon: float, track_id: str = "FAKE-PHONE",
             basic_type=_btype,
             lat=float(lat),
             lon=float(lon),
-            speed_mps=0.5 if speed_mps is None else float(speed_mps),
+            # None stays None. This used to become 0.5 m/s on the bridge path
+            # only, so one phone had different kinematics over BLE and HTTP.
+            speed_mps=None if speed_mps is None else float(speed_mps),
             heading_deg=heading_deg if heading_deg is None else float(heading_deg),
             accuracy_m=accuracy_m,
             # Same GNSS-accuracy -> confidence curve the BLE-in adapter uses, so a
@@ -376,7 +419,7 @@ def _publish_safewalk(lat: float, lon: float, track_id: str = "FAKE-PHONE",
             t_sender=None,
             t_sender_utc=t_sender_utc,
             time_source=_tsrc,
-            t_recv=time.monotonic(),
+            t_recv=_clock(),
             radius_of_curve_m=radius_of_curve_m,
             path_confidence=path_confidence,
         )

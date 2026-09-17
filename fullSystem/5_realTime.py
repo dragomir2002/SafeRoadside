@@ -16,7 +16,8 @@ import time
 from gateway_glue import (start_gateway, publish as gw_publish,
                           start_safewalk_injector, start_safewalk_http_bridge,
                           get_latest_safewalk, get_gateway_stats,
-                          set_verbose_pedestrians)
+                          set_verbose_pedestrians, wait_gateway_idle)
+from rsu_kinematics import KinematicsEstimator, ReplayClock, pixel_to_latlon
 
 # -----------------------------------------------------------------------------
 # CONFIGURAÇÃO DE LOGGING
@@ -55,7 +56,9 @@ def load_map_data(map_file="map.txt"):
             row_vals = list(map(float, lines[i].split()))
             h_rows.append(row_vals)
 
-        homography_mat = np.array(h_rows, dtype=np.float32)
+        # float64: in float32 the lat/lon arithmetic quantised every published
+        # position to a 0.38 m grid (see rsu_kinematics.py).
+        homography_mat = np.array(h_rows, dtype=np.float64)
 
         if homography_mat.shape != (3, 3):
             raise ValueError("A matriz de homografia não possui dimensões 3x3.")
@@ -266,10 +269,6 @@ def load_scene(map_file="map.txt", traj_file="trajetoriasClean.txt"):
         print(f"[AVISO] '{traj_file}' not found - vehicle trajectory prediction "
               f"is DISABLED (pedestrian EKF still runs)")
 
-# Cache of (last_lat, last_lon, last_t) per track_id, used to estimate
-# speed_mps + heading_deg from successive detector frames so the gateway's
-# TTC math has something to work with.
-gw_track_history: dict = {}
 
 # -----------------------------------------------------------------------------
 # 6) VARIÁVEIS GLOBAIS
@@ -378,6 +377,10 @@ def parse_args():
         help="Stop after N frames (0 = run to the end). Useful for a quick check."
     )
     parser.add_argument(
+        "--run-id", default=None,
+        help="Tag every gateway record with this run id (eval/*.py --run-id ID)"
+    )
+    parser.add_argument(
         "--no-gateway", action="store_true",
         help="Skip the SafeCorners fusion gateway / SafeWalk bridge and run\n"
              "the pure computer-vision pipeline only"
@@ -411,7 +414,11 @@ class VideoSource:
             sys.exit(1)
         w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        print(f"[INFO] Source: video '{path}' ({w}x{h})")
+        self.fps = self.cap.get(cv2.CAP_PROP_FPS)
+        # Frames successfully read, across --loop restarts: the replay clock's
+        # frame index must never go backwards.
+        self.frames_read = 0
+        print(f"[INFO] Source: video '{path}' ({w}x{h}, {self.fps:.3f} fps)")
 
     def grab(self):
         ret, frame = self.cap.read()
@@ -421,6 +428,7 @@ class VideoSource:
                 ret, frame = self.cap.read()
             if not ret:
                 return None
+        self.frames_read += 1
         return frame
 
     def progress(self):
@@ -658,10 +666,30 @@ def main():
 
     print("[INFO] Starting detection loop... (press 'q' on the window to quit)")
 
+    # Time base for everything the gateway measures. Recorded footage replays
+    # slower than real time, so its clock is the video's own: one frame is
+    # 1/fps seconds of scene. Live capture runs in real time, so wall time is
+    # scene time. See rsu_kinematics.ReplayClock.
+    if isinstance(source, VideoSource):
+        clock = ReplayClock(source.fps)
+        print(f"[INFO] replay clock: scene time = frame index / {source.fps:.3f} fps")
+    else:
+        clock = time.monotonic
+    kin = KinematicsEstimator()
+    t_frame = clock()
+    replay_clock = None
+
     if args.no_gateway:
         print("[INFO] gateway disabled (--no-gateway) - CV pipeline only")
     else:
-        start_gateway()
+        # Only a replay clock is injected: the gateway labels a run "replay"
+        # exactly when it is given a clock, and live capture runs on its own
+        # monotonic clock (passing time.monotonic here mislabelled live runs).
+        replay_clock = clock if isinstance(clock, ReplayClock) else None
+        if not start_gateway(run_id=args.run_id, clock=replay_clock):
+            print("[ERRO] gateway failed to start; refusing to run blind "
+                  "(use --no-gateway for the CV pipeline only)")
+            sys.exit(1)
         start_safewalk_injector()
         # Anchor the SafeWalk avatar on THIS scene's origin. It used to be
         # pinned to the Michigan demo clip (41.9407, -85.0010), which put the
@@ -678,6 +706,9 @@ def main():
             if frame is None:
                 print("[INFO] End of video / no more frames.")
                 break
+            if isinstance(clock, ReplayClock):
+                clock.set_frame(source.frames_read - 1)
+            t_frame = clock()   # ONE capture time for every track of this frame
 
             orig_h, orig_w = frame.shape[:2]
 
@@ -701,7 +732,10 @@ def main():
                 infer_frame = frame
 
             # 3) Detecção com YOLO (on smaller frame)
-            results = model.predict(infer_frame, verbose=False)
+            # imgsz must be explicit: without it ultralytics letterboxes to its
+            # 640 px default, discarding the 1920 resize above (on BIB_IST's
+            # frame 0 that is 10 vehicles detected instead of 23).
+            results = model.predict(infer_frame, imgsz=INFER_WIDTH, verbose=False)
             yolo_boxes = results[0].boxes
 
             # 4) Converter predições YOLO para DeepSort (scale back to original)
@@ -754,37 +788,28 @@ def main():
                 # Atribui cor única
                 color = color_map.setdefault(track_id, get_random_color())
 
-                # Publish this track's GPS position to the SafeCorners gateway
-                try:
-                    _pt = np.array([[center[0]], [center[1]], [1]], dtype=np.float32)
-                    _XYW = homography_mat @ _pt
-                    _X, _Y, _W = _XYW[0, 0], _XYW[1, 0], _XYW[2, 0]
-                    if abs(_W) >= 1e-12:
-                        _X /= _W
-                        _Y /= _W
-                        _lat, _lon = xy_to_latlon(_X, _Y, lat0_deg, lon0_deg)
-                        # Estimate speed_mps + heading_deg from successive frames.
-                        # gw_track_history caches (last_lat, last_lon, last_t) per
-                        # track_id; the gateway needs these to compute TTC.
-                        _now = time.time()
-                        _spd = None
-                        _hdg = None
-                        prev = gw_track_history.get(track_id)
-                        if prev is not None:
-                            _plat, _plon, _pt_ = prev
-                            _dt = _now - _pt_
-                            if 0.05 < _dt < 2.0:  # ignore jitter / stale
-                                _dnorth = math.radians(_lat - _plat) * 6_371_000.0
-                                _deast = math.radians(_lon - _plon) * 6_371_000.0 * math.cos(math.radians(_lat))
-                                _dist = math.hypot(_dnorth, _deast)
-                                _spd = _dist / _dt
-                                if _dist > 0.05:  # meaningful displacement
-                                    _hdg = (math.degrees(math.atan2(_deast, _dnorth)) + 360) % 360
-                        gw_track_history[track_id] = (_lat, _lon, _now)
-                        gw_publish(track_id, obj_class, _lat, _lon,
-                                   speed_mps=_spd, heading_deg=_hdg)
-                except Exception:
-                    pass  # never let gateway publishing break the detector
+                # Publish this track to the SafeCorners gateway. Geometry and
+                # velocity live in rsu_kinematics: float64, and a scene-time
+                # baseline instead of one wall-clock frame step.
+                if not args.no_gateway:
+                    try:
+                        # The unrounded box centre: truncating to int and
+                        # halving threw away up to a pixel, which is metres
+                        # at the ranges that set the 4-8 s band.
+                        _ll = pixel_to_latlon((ltrb[0] + ltrb[2]) / 2.0,
+                                              (ltrb[1] + ltrb[3]) / 2.0,
+                                              homography_mat, lat0_deg, lon0_deg)
+                        if _ll is not None:
+                            _spd, _hdg = kin.update(track_id, t_frame, _ll[0], _ll[1])
+                            gw_publish(track_id, obj_class, _ll[0], _ll[1],
+                                       speed_mps=_spd, heading_deg=_hdg, t_recv=t_frame)
+                    except Exception as _e:
+                        # Never let publishing break the detector -- but never
+                        # let it fail silently either.
+                        if not getattr(main, "_publish_warned", False):
+                            print(f"[AVISO] gateway publish failed: {_e!r} "
+                                  f"(further failures not printed)")
+                            main._publish_warned = True
 
                 # Desenhar bounding box e label
                 _t = max(2, int(2 * DRAW_SCALE))
@@ -818,6 +843,16 @@ def main():
                         cv2.circle(frame, (int(pt[0]), int(pt[1])), max(5, int(5 * DRAW_SCALE)), color, -1)
                     future_vru_points.extend(pred_points)
 
+            kin.prune(t_frame)   # forget tracks unseen for more than max_gap_s
+
+            # Lock-step replay: let the gateway finish this frame before the
+            # replay clock moves on, so its decisions do not depend on how far
+            # the detector got ahead (see safecorners_gateway.main.wait_idle).
+            if replay_clock is not None and not wait_gateway_idle():
+                print("[ERRO] gateway did not drain; stopping rather than "
+                      "producing timing-dependent results")
+                break
+
             # 7) DETECTAR POSSÍVEIS COLISÕES (EM PIXEL) E CONVERTER P/ GPS
             for car_pt in future_car_points:
                 for person_pt in future_vru_points:
@@ -829,7 +864,7 @@ def main():
                         n_collisions += 1
                         cv2.circle(frame, (Px, Py), max(20, int(20 * DRAW_SCALE)), (0, 0, 255), -1)
 
-                        pt = np.array([[Px], [Py], [1]], dtype=np.float32)
+                        pt = np.array([[Px], [Py], [1]], dtype=np.float64)
                         XYW = homography_mat @ pt
                         X, Y, W = XYW[0, 0], XYW[1, 0], XYW[2, 0]
 
@@ -877,7 +912,7 @@ def main():
             try:
                 for sw_tid, (sw_lat, sw_lon) in get_latest_safewalk().items():
                     sX, sY = latlon_to_xy(sw_lat, sw_lon, lat0_deg, lon0_deg)
-                    sxy = homography_mat_inv @ np.array([sX, sY, 1.0], dtype=np.float32)
+                    sxy = homography_mat_inv @ np.array([sX, sY, 1.0], dtype=np.float64)
                     if abs(sxy[2]) > 1e-9:
                         spx = int(sxy[0] / sxy[2])
                         spy = int(sxy[1] / sxy[2])
