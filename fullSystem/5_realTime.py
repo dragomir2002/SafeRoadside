@@ -381,6 +381,14 @@ def parse_args():
         help="Tag every gateway record with this run id (eval/*.py --run-id ID)"
     )
     parser.add_argument(
+        "--no-translate", action="store_true",
+        help="FIELD TRIALS: use the phone's real coordinates instead of "
+             "transplanting its motion onto this scene's origin. Required when "
+             "the phone is physically inside the calibrated scene, otherwise the "
+             "avatar is displaced by (first fix - map origin) and cannot "
+             "associate with the RSU's own detection of the same person."
+    )
+    parser.add_argument(
         "--no-gateway", action="store_true",
         help="Skip the SafeCorners fusion gateway / SafeWalk bridge and run\n"
              "the pure computer-vision pipeline only"
@@ -695,7 +703,11 @@ def main():
         # pinned to the Michigan demo clip (41.9407, -85.0010), which put the
         # avatar ~7000 km away from any non-demo scene and killed fusion.
         start_safewalk_http_bridge(video_anchor_lat=lat0_deg,
-                                   video_anchor_lon=lon0_deg)
+                                   video_anchor_lon=lon0_deg,
+                                   translate=not args.no_translate)
+        if args.no_translate:
+            print("[INFO] --no-translate: phone coordinates are used as they "
+                  "arrive (field-trial mode, no video anchoring)")
 
     try:
         while True:

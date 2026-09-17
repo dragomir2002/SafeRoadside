@@ -504,11 +504,70 @@ def start_safewalk_injector() -> None:
     log.info("safewalk inject watcher started (write to %s)", INJECT_FILE)
 
 
+class AnchorTranslator:
+    """Real phone coordinates -> the coordinates the gateway is told.
+
+    `translate=True` (recorded footage): the first accepted fix becomes "home"
+    and maps to the video anchor; every later fix is applied as a north/east
+    delta from home. The motion is real, the absolute position is synthetic --
+    which is why a bridged run is not a field trial (docs/04 §7).
+
+    `translate=False` (field trial): positions pass through untouched, because
+    the phone is already standing inside the calibrated scene. Translating
+    there displaces the avatar by (first fix - map origin), so the RSU's own
+    detection of that same person can never associate with it and one road
+    user becomes two warning streams (HANDOFF §0.7).
+
+    Junk fixes are dropped in both modes, and a dropped fix must not become
+    home: SafeWalk emits the placeholder (12.34, 56.78) before its first GPS
+    lock, and accepting it as home would shove every later position ~7000 km
+    off-frame.
+    """
+
+    R_EARTH_M = 6_371_000.0
+
+    def __init__(self, video_anchor_lat: float, video_anchor_lon: float,
+                 translate: bool = True) -> None:
+        self.video_anchor_lat = float(video_anchor_lat)
+        self.video_anchor_lon = float(video_anchor_lon)
+        self.translate = bool(translate)
+        self.home: Optional[tuple[float, float]] = None
+
+    @staticmethod
+    def is_junk(lat: float, lon: float) -> bool:
+        return bool((abs(lat - 12.34) < 1e-3 and abs(lon - 56.78) < 1e-3)
+                    or (abs(lat) < 1e-6 and abs(lon) < 1e-6)
+                    or not (-90.0 <= lat <= 90.0)
+                    or not (-180.0 <= lon <= 180.0))
+
+    def __call__(self, real_lat: float, real_lon: float):
+        import math
+
+        if self.is_junk(real_lat, real_lon):
+            return None
+        if not self.translate:
+            return real_lat, real_lon
+        if self.home is None:
+            self.home = (real_lat, real_lon)
+            log.info("[BRIDGE] home anchor set: real=(%.7f, %.7f) -> video=(%.7f, %.7f)",
+                     real_lat, real_lon, self.video_anchor_lat, self.video_anchor_lon)
+            return self.video_anchor_lat, self.video_anchor_lon
+        home_lat, home_lon = self.home
+        dnorth = math.radians(real_lat - home_lat) * self.R_EARTH_M
+        deast = (math.radians(real_lon - home_lon) * self.R_EARTH_M
+                 * math.cos(math.radians(home_lat)))
+        out_lat = self.video_anchor_lat + math.degrees(dnorth / self.R_EARTH_M)
+        out_lon = self.video_anchor_lon + math.degrees(
+            deast / (self.R_EARTH_M * math.cos(math.radians(self.video_anchor_lat))))
+        return out_lat, out_lon
+
+
 def start_safewalk_http_bridge(host: str = "0.0.0.0", port: int = 8765,
                                video_anchor_lat: Optional[float] = None,
                                video_anchor_lon: Optional[float] = None,
                                force_heading_deg: Optional[float] = None,
-                               force_speed_mps: Optional[float] = None) -> None:
+                               force_speed_mps: Optional[float] = None,
+                               translate: bool = True) -> None:
     """HTTP bridge: accept POSTed SafeWalk PSMs from the Windows scanner, translate
     real-world coords to video-anchor coords, and publish to the gateway.
 
@@ -546,37 +605,10 @@ def start_safewalk_http_bridge(host: str = "0.0.0.0", port: int = 8765,
             log.error("could not read map.txt: %s", e)
             return
 
-    home_lat: list = [None]  # mutable cell
-
-    import math
-    R_EARTH = 6_371_000.0
-
-    def _translate(real_lat: float, real_lon: float) -> tuple[float, float] | None:
-        # Reject obvious placeholder/no-GPS-lock packets. SafeWalk emits
-        # (12.34, 56.78) before its first GPS fix; a (0, 0) "Null Island"
-        # fix or any wildly-out-of-range coord is also bogus. Returning
-        # None makes the bridge drop the PSM instead of poisoning the
-        # home anchor or shoving the avatar miles off-frame.
-        if (abs(real_lat - 12.34) < 1e-3 and abs(real_lon - 56.78) < 1e-3) \
-           or (abs(real_lat) < 1e-6 and abs(real_lon) < 1e-6) \
-           or not (-90.0 <= real_lat <= 90.0) \
-           or not (-180.0 <= real_lon <= 180.0):
-            return None
-        if home_lat[0] is None:
-            home_lat[0] = real_lat
-            home_lat.append(real_lon)  # store lon at index 1
-            log.info("[BRIDGE] home anchor set: real=(%.7f, %.7f) -> video=(%.7f, %.7f)",
-                     real_lat, real_lon, video_anchor_lat, video_anchor_lon)
-            return video_anchor_lat, video_anchor_lon
-        # delta in meters from home
-        dlat = math.radians(real_lat - home_lat[0])
-        dlon = math.radians(real_lon - home_lat[1])
-        dnorth = dlat * R_EARTH
-        deast = dlon * R_EARTH * math.cos(math.radians(home_lat[0]))
-        # apply delta to video anchor
-        out_lat = video_anchor_lat + math.degrees(dnorth / R_EARTH)
-        out_lon = video_anchor_lon + math.degrees(deast / (R_EARTH * math.cos(math.radians(video_anchor_lat))))
-        return out_lat, out_lon
+    # The translation lives in AnchorTranslator so it can be tested without
+    # starting a server, and so a field trial can switch it off.
+    _translate = AnchorTranslator(video_anchor_lat, video_anchor_lon,
+                                  translate=translate)
 
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     import json as _json
@@ -663,8 +695,11 @@ def start_safewalk_http_bridge(host: str = "0.0.0.0", port: int = 8765,
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
             self.end_headers()
-            home_str = "unset" if home_lat[0] is None else f"({home_lat[0]:.7f}, {home_lat[1]:.7f})"
-            self.wfile.write(f"safewalk bridge OK\nhome={home_str}\nvideo_anchor=({video_anchor_lat}, {video_anchor_lon})\n".encode())
+            home_str = ("unset" if _translate.home is None
+                        else f"({_translate.home[0]:.7f}, {_translate.home[1]:.7f})")
+            mode = "anchored to video" if _translate.translate else "real coordinates (no translation)"
+            self.wfile.write(f"safewalk bridge OK\nmode={mode}\nhome={home_str}\n"
+                             f"video_anchor=({video_anchor_lat}, {video_anchor_lon})\n".encode())
 
     def _server() -> None:
         # Threading, not plain HTTPServer. BLE re-advertises the same PSM
@@ -675,8 +710,13 @@ def start_safewalk_http_bridge(host: str = "0.0.0.0", port: int = 8765,
         # is really just busy.
         srv = ThreadingHTTPServer((host, port), _Handler)
         srv.daemon_threads = True
-        log.info("safewalk HTTP bridge listening on %s:%d (video anchor=%.6f, %.6f)",
-                 host, port, video_anchor_lat, video_anchor_lon)
+        if translate:
+            log.info("safewalk HTTP bridge listening on %s:%d (video anchor=%.6f, %.6f)",
+                     host, port, video_anchor_lat, video_anchor_lon)
+        else:
+            log.info("safewalk HTTP bridge listening on %s:%d "
+                     "(NO TRANSLATION: phone coordinates used as they arrive)",
+                     host, port)
         srv.serve_forever()
 
     threading.Thread(target=_server, name="safewalk-http-bridge", daemon=True).start()
