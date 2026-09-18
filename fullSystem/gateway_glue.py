@@ -41,6 +41,17 @@ _clock = time.monotonic
 _adapter_getter = None  # callable -> RsuAdapter
 _print_pedestrian_gps = True  # toggled by start_gateway(verbose_pedestrians=...)
 _safewalk_watcher_started = False
+# Which of the detector's OWN observations reach the gateway. "both" is normal
+# operation; the others emulate an occluded or absent RSU for the R5 trials of
+# the evaluation plan §2, with the clip still driving the replay clock. Injected peer
+# observations (phones, scripted actors) are never filtered -- a phone is not
+# the RSU, and mode "none" exists precisely so the cooperative path can be
+# measured alone.
+_RSU_PUBLISH_MODES = {"both", "vehicles", "vru", "none"}
+_rsu_publish = "both"
+# Open CSV of everything published, for scenario authoring (--dump-observations).
+_dump_fh = None
+_dump_fps = 0.0
 # Platform temp dir: /tmp on Linux, the user's temp dir on Windows.
 INJECT_FILE = Path(tempfile.gettempdir()) / "safewalk_inject.txt"
 
@@ -76,6 +87,9 @@ _stats: dict = {
     "inject_rejected": 0,
 }
 _stats_lock = threading.Lock()
+# Which sources have gone quiet (R5). Fed from the ingest records, judged in
+# their own timebase -- see SourceFreshness.stale_relative.
+_freshness = None   # SourceFreshness, created below once the class exists
 
 
 def _observe(rec: dict) -> None:
@@ -88,6 +102,11 @@ def _observe(rec: dict) -> None:
                 _stats["ingest_rsu"] += 1
             elif src:
                 _stats["ingest_phone"] += 1
+            # t_scene on a replay run, wall time live: either way the records
+            # share one timebase, which is what staleness is judged in.
+            t_rec = rec.get("t_scene", rec.get("t"))
+            if src and t_rec is not None and _freshness is not None:
+                _freshness.saw(src, t_rec)
         elif stage == "associate":
             _stats["assoc_matched" if rec.get("matched") else "assoc_unmatched"] += 1
         elif stage == "fuse":
@@ -145,6 +164,21 @@ def get_gateway_stats() -> dict:
         for k in ("last_fuse", "safewalk"):
             if isinstance(_stats.get(k), dict):
                 out[k] = dict(_stats[k])
+        # R5: which subsystems have fallen silent. Reported here rather than on
+        # a timer because this is already called every frame, and logged on the
+        # transition so a quiet source does not print once per frame.
+        if _freshness is not None:
+            out["stale_sources"] = _freshness.stale_relative()
+            newest = max(_freshness.last_seen.values(), default=None)
+            if newest is not None:
+                for src in _freshness.newly_stale(newest):
+                    log.warning("source %s has gone quiet (no observation for "
+                                "%.1f s of pipeline time); continuing on the rest",
+                                src, _freshness.silence_s)
+            for src in _freshness.newly_returned():
+                log.info("source %s is publishing again", src)
+        else:
+            out["stale_sources"] = []
         return out
 
 
@@ -269,6 +303,74 @@ def wait_gateway_idle(timeout: float = 60.0) -> bool:
     return ok
 
 
+def start_observation_dump(path, fps: float) -> None:
+    """Write every published observation to CSV, for scenario authoring.
+
+    The gateway log carries no coordinates, so this is the only record of what
+    the detector actually published. `t_scene` is seconds of video -- the same
+    timebase as the labels of `tools/make-labels.py` -- so a scenario can be
+    built to meet a real recorded vehicle at a real instant.
+    """
+    global _dump_fh, _dump_fps
+    if _dump_fh is not None:
+        return
+    if not fps or fps <= 0:
+        raise ValueError(f"observation dump needs the video frame rate, got {fps!r}")
+    _dump_fps = float(fps)
+    _dump_fh = open(path, "w", encoding="utf-8", newline="")
+    _dump_fh.write("t_scene,source,track_id,basic_type,lat,lon,speed_mps,heading_deg\n")
+    _dump_fh.flush()
+    log.info("observation dump -> %s (%.3f fps)", path, _dump_fps)
+
+
+def stop_observation_dump() -> None:
+    global _dump_fh, _dump_fps
+    if _dump_fh is not None:
+        _dump_fh.close()
+    _dump_fh = None
+    _dump_fps = 0.0
+
+
+def record_observation_sample(frame_index: int, source: str, track_id: str,
+                              basic_type: str, lat: float, lon: float,
+                              speed_mps, heading_deg) -> None:
+    """One CSV row. No-op unless start_observation_dump() was called.
+
+    `basic_type` may be given as the detector's own class ("car", "person",
+    "bicycle"); it is recorded canonically ("vehicle", "pedestrian", "cyclist")
+    so the CSV speaks the same vocabulary as association and the script format.
+    """
+    if _dump_fh is None:
+        return
+    basic_type = _basic_type_for(basic_type) or basic_type
+    t_scene = frame_index / _dump_fps
+
+    def _f(v):
+        return "" if v is None else f"{v:.1f}"
+
+    _dump_fh.write(f"{t_scene:.4f},{source},{track_id},{basic_type},"
+                   f"{lat:.7f},{lon:.7f},{_f(speed_mps)},{_f(heading_deg)}\n")
+
+
+def set_rsu_publish_filter(mode: str) -> None:
+    """Restrict the detector's own publications, for the R5 degradation modes.
+
+    "both" (default) is normal operation. "vehicles" emulates an RSU that sees
+    traffic but not the VRU -- the thesis's NLOS case, where the phone has to
+    supply the VRU. "none" emulates an absent RSU. Only `publish()` is affected:
+    injected peer observations still flow, which is what makes the cooperative
+    path measurable on its own.
+    """
+    global _rsu_publish
+    if mode not in _RSU_PUBLISH_MODES:
+        raise ValueError(
+            f"rsu publish filter must be one of {sorted(_RSU_PUBLISH_MODES)}, got {mode!r}")
+    _rsu_publish = mode
+    if mode != "both":
+        log.warning("RSU publish filter: %s -- the gateway will NOT see all "
+                    "detector observations (R5 trial mode)", mode)
+
+
 def publish(track_id, obj_class: str, lat: float, lon: float,
             confidence: float = 0.85,
             speed_mps: Optional[float] = None,
@@ -285,6 +387,12 @@ def publish(track_id, obj_class: str, lat: float, lon: float,
     basic_type = _basic_type_for(obj_class)
     if basic_type is None:
         return  # class we don't care about (e.g., dog, traffic light)
+    if _rsu_publish == "none":
+        return
+    if _rsu_publish == "vehicles" and basic_type != "vehicle":
+        return
+    if _rsu_publish == "vru" and basic_type == "vehicle":
+        return
     try:
         adapter = _adapter_getter()
     except RuntimeError:
@@ -470,6 +578,79 @@ def _publish_safewalk(lat: float, lon: float, track_id: str = "FAKE-PHONE",
     return published
 
 
+class SourceFreshness:
+    """When did each source last say anything, and which have gone quiet?
+
+    the architecture doc §7.1 described a staleness monitor that was never implemented, so an
+    RSU that stops publishing looked exactly like an intersection with no
+    traffic. R5 is about continuing to function when a subsystem drops out, and
+    that starts with noticing.
+
+    A source never seen is NOT stale: "SafeBike absent" is normal operation, not
+    a fault. Only sources that have spoken at least once can fall silent.
+
+    `newly_stale` / `newly_returned` report edges rather than levels, so a caller
+    on the frame loop logs once per transition instead of once per frame.
+    """
+
+    def __init__(self, silence_s: float = 5.0) -> None:
+        self.silence_s = float(silence_s)
+        self.last_seen: dict = {}
+        self._reported: set = set()
+        self._returned: list = []
+
+    def saw(self, source: str, t: float) -> None:
+        if source in self._reported:
+            self._reported.discard(source)
+            self._returned.append(source)
+        self.last_seen[source] = float(t)
+
+    def stale(self, t: float) -> list:
+        return sorted(s for s, last in self.last_seen.items()
+                      if t - last >= self.silence_s)
+
+    def stale_relative(self) -> list:
+        """Stale judged against the newest record seen, so no clock is read.
+
+        The pipeline's timebase is the replay clock on recorded footage, which
+        runs about 9x slower than the wall clock; a wall-clock threshold would
+        call every source stale. Taking the newest observation as "now" is
+        correct in both live and replay runs.
+
+        Limit: if *everything* stops, "now" stops advancing too, so total
+        silence reads as an empty log rather than as a stale source.
+        """
+        if not self.last_seen:
+            return []
+        return self.stale(max(self.last_seen.values()))
+
+    def newly_stale(self, t: float) -> list:
+        """Sources that crossed the silence threshold since the last call."""
+        out = [s for s in self.stale(t) if s not in self._reported]
+        self._reported.update(out)
+        return out
+
+    def newly_returned(self) -> list:
+        """Sources that spoke again after having been reported stale."""
+        out, self._returned = sorted(self._returned), []
+        return out
+
+
+_freshness = SourceFreshness()
+
+
+def publish_peer_observation(**kwargs) -> None:
+    """Public entry point for an injected peer observation.
+
+    Used by the scripted-actor path of the R5 and accuracy trials, so scenario
+    code does not reach for a private name. The keywords are exactly
+    `_publish_safewalk`'s. Deliberately NOT subject to the RSU publish filter: a
+    phone is not the RSU, and `set_rsu_publish_filter("none")` exists so the
+    cooperative path can be measured with the RSU withheld.
+    """
+    _publish_safewalk(**kwargs)
+
+
 def start_safewalk_injector() -> None:
     """Start a background thread that watches INJECT_FILE.
 
@@ -510,13 +691,13 @@ class AnchorTranslator:
     `translate=True` (recorded footage): the first accepted fix becomes "home"
     and maps to the video anchor; every later fix is applied as a north/east
     delta from home. The motion is real, the absolute position is synthetic --
-    which is why a bridged run is not a field trial (docs/04 §7).
+    which is why a bridged run is not a field trial (the evaluation plan §7).
 
     `translate=False` (field trial): positions pass through untouched, because
     the phone is already standing inside the calibrated scene. Translating
     there displaces the avatar by (first fix - map origin), so the RSU's own
     detection of that same person can never associate with it and one road
-    user becomes two warning streams (HANDOFF §0.7).
+    user becomes two warning streams .
 
     Junk fixes are dropped in both modes, and a dropped fix must not become
     home: SafeWalk emits the placeholder (12.34, 56.78) before its first GPS

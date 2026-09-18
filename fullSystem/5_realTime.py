@@ -16,7 +16,10 @@ import time
 from gateway_glue import (start_gateway, publish as gw_publish,
                           start_safewalk_injector, start_safewalk_http_bridge,
                           get_latest_safewalk, get_gateway_stats,
-                          set_verbose_pedestrians, wait_gateway_idle)
+                          set_verbose_pedestrians, wait_gateway_idle,
+                          set_rsu_publish_filter, publish_peer_observation,
+                          start_observation_dump, stop_observation_dump,
+                          record_observation_sample)
 from rsu_kinematics import KinematicsEstimator, ReplayClock, pixel_to_latlon
 
 # -----------------------------------------------------------------------------
@@ -381,6 +384,27 @@ def parse_args():
         help="Tag every gateway record with this run id (eval/*.py --run-id ID)"
     )
     parser.add_argument(
+        "--dump-observations", default=None,
+        help="CSV of every observation the detector publishes, in video time. "
+             "Feeds tools/make-vru-script.py, which builds a conflict against a "
+             "real recorded vehicle."
+    )
+    parser.add_argument(
+        "--vru-script", default=None,
+        help="JSONL scripted actors replayed in scene time "
+             "(vru_script.py); disables the wall-clock inject watcher. One file "
+             "may carry several actors, separated by track_id, so a scripted "
+             "vehicle and VRU can run together (R5 mode M3)."
+    )
+    parser.add_argument(
+        "--rsu-publish", default="both",
+        choices=["both", "vehicles", "vru", "none"],
+        help="R5 trials: withhold some of the detector's own observations. "
+             "'vehicles' emulates an RSU that sees traffic but not the VRU, "
+             "'none' an absent RSU. The clip still drives the replay clock, and "
+             "injected phone observations are unaffected."
+    )
+    parser.add_argument(
         "--no-translate", action="store_true",
         help="FIELD TRIALS: use the phone's real coordinates instead of "
              "transplanting its motion onto this scene's origin. Required when "
@@ -698,7 +722,28 @@ def main():
             print("[ERRO] gateway failed to start; refusing to run blind "
                   "(use --no-gateway for the CV pipeline only)")
             sys.exit(1)
-        start_safewalk_injector()
+        if args.dump_observations:
+            if replay_clock is None:
+                print("[ERRO] --dump-observations needs a replay clock (recorded source)")
+                sys.exit(2)
+            start_observation_dump(args.dump_observations, replay_clock.fps)
+        if args.rsu_publish != "both":
+            set_rsu_publish_filter(args.rsu_publish)
+            print(f"[INFO] --rsu-publish {args.rsu_publish}: the gateway will not "
+                  f"see all detector observations (R5 trial mode)")
+        vru = None
+        if args.vru_script:
+            if replay_clock is None:
+                print("[ERRO] --vru-script needs a replay clock (recorded source)")
+                sys.exit(2)
+            from vru_script import VruScript
+            vru = VruScript.load(args.vru_script)
+            actors = sorted({s.get("track_id", "SCRIPT-VRU") for s in vru.samples})
+            print(f"[INFO] VRU script: {len(vru.samples)} samples, video "
+                  f"{vru.samples[0]['t']:.2f}-{vru.samples[-1]['t']:.2f} s, "
+                  f"actors {actors}")
+        else:
+            start_safewalk_injector()
         # Anchor the SafeWalk avatar on THIS scene's origin. It used to be
         # pinned to the Michigan demo clip (41.9407, -85.0010), which put the
         # avatar ~7000 km away from any non-demo scene and killed fusion.
@@ -721,6 +766,19 @@ def main():
             if isinstance(clock, ReplayClock):
                 clock.set_frame(source.frames_read - 1)
             t_frame = clock()   # ONE capture time for every track of this frame
+
+            # Scripted actors ride the same clock as the detector's own tracks,
+            # so a constructed conflict happens at a known second of video.
+            if vru is not None:
+                for sample in vru.due((source.frames_read - 1) / clock.fps):
+                    publish_peer_observation(
+                        lat=float(sample["lat"]), lon=float(sample["lon"]),
+                        track_id=str(sample.get("track_id", "SCRIPT-VRU")),
+                        speed_mps=sample.get("speed_mps"),
+                        heading_deg=sample.get("heading_deg"),
+                        accuracy_m=sample.get("accuracy_m", 3.0),
+                        source=sample.get("source", "SafeWalk"),
+                        basic_type=sample.get("basic_type", "pedestrian"))
 
             orig_h, orig_w = frame.shape[:2]
 
@@ -815,6 +873,11 @@ def main():
                             _spd, _hdg = kin.update(track_id, t_frame, _ll[0], _ll[1])
                             gw_publish(track_id, obj_class, _ll[0], _ll[1],
                                        speed_mps=_spd, heading_deg=_hdg, t_recv=t_frame)
+                            record_observation_sample(
+                                frame_index=source.frames_read - 1, source="RSU",
+                                track_id=str(track_id), basic_type=obj_class,
+                                lat=_ll[0], lon=_ll[1],
+                                speed_mps=_spd, heading_deg=_hdg)
                     except Exception as _e:
                         # Never let publishing break the detector -- but never
                         # let it fail silently either.
@@ -1058,6 +1121,7 @@ def main():
 
     finally:
         source.release()
+        stop_observation_dump()      # flush the CSV even if the run was cut short
         if writer is not None:
             writer.release()
             print(f"[OK] annotated video saved -> {args.save_video}")
