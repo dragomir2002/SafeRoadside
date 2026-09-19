@@ -4,12 +4,14 @@ The detection loop reads each track through is_confirmed(), time_since_update,
 track_id, to_ltrb() and get_det_class(). Keeping that interface means the
 tracker is the only thing that changes between the two arms of the A/B.
 """
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import yaml
 
-from bytetrack_adapter import tracks_from_boxes
+from bytetrack_adapter import default_tracker_cfg, tracks_from_boxes
 
 
 def _boxes(ids, xyxy, cls):
@@ -53,3 +55,24 @@ def test_torch_like_tensors_are_accepted():
     t = tracks_from_boxes(b, scale=1.0)[0]
     assert (t.track_id, t.get_det_class()) == ("5", 7)
     assert t.to_ltrb() == pytest.approx([1, 2, 3, 4])
+
+
+def test_default_tracker_cfg_is_an_existing_absolute_path():
+    """run-bib.ps1 cd's into the scene folder, so a relative name would not resolve."""
+    path = Path(default_tracker_cfg())
+    assert path.is_absolute()
+    assert path.is_file()
+
+
+def test_shipped_cfg_keeps_lost_ids_3_s_and_is_stock_otherwise():
+    """Only track_buffer differs from ultralytics' cfg/trackers/bytetrack.yaml."""
+    cfg = yaml.safe_load(Path(default_tracker_cfg()).read_text(encoding="utf-8"))
+    assert cfg == {
+        "tracker_type": "bytetrack",
+        "track_high_thresh": 0.25,
+        "track_low_thresh": 0.1,
+        "new_track_thresh": 0.25,
+        "track_buffer": 90,
+        "match_thresh": 0.8,
+        "fuse_score": True,
+    }

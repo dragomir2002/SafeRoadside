@@ -1,0 +1,19 @@
+# ByteTrack for the RSU: ultralytics' cfg/trackers/bytetrack.yaml with a longer
+# memory for lost tracks. Every other value is the stock default.
+#
+# track_buffer counts frames. ultralytics builds the tracker with frame_rate=30
+# for any source (trackers/track.py), so a lost track is dropped after
+# int(30 / 30 * track_buffer) frames: 90 frames = 3.0 s of the 29.97 fps
+# BIB_IST clip. The stock 30 (1 s) gave a road user hidden behind another for
+# more than a second a new ID, and the fusion stage a new pair to warn about.
+#
+# Only the ID survives the gap, not the velocity: KinematicsEstimator
+# (rsu_kinematics.py, max_gap_s=1.0) still restarts a track's speed after a
+# gap of more than 1 s, because a 3 s old velocity is stale.
+tracker_type: bytetrack
+track_high_thresh: 0.25
+track_low_thresh: 0.1
+new_track_thresh: 0.25
+track_buffer: 90
+match_thresh: 0.8
+fuse_score: True

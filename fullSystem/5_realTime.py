@@ -21,7 +21,7 @@ from gateway_glue import (start_gateway, publish as gw_publish,
                           start_observation_dump, stop_observation_dump,
                           record_observation_sample)
 from rsu_kinematics import KinematicsEstimator, ReplayClock, pixel_to_latlon
-from bytetrack_adapter import tracks_from_boxes
+from bytetrack_adapter import default_tracker_cfg, tracks_from_boxes
 
 # -----------------------------------------------------------------------------
 # CONFIGURAÇÃO DE LOGGING
@@ -409,10 +409,18 @@ def parse_args():
              "injected phone observations are unaffected."
     )
     parser.add_argument(
-        "--tracker", default="deepsort", choices=["deepsort", "bytetrack"],
-        help="Multi-object tracker. 'deepsort' (default) is the original and the "
-             "one every published figure used; 'bytetrack' is ultralytics' "
-             "ByteTrack (detection + tracking in one call, no appearance model)."
+        "--tracker", default="bytetrack", choices=["deepsort", "bytetrack"],
+        help="Multi-object tracker. 'bytetrack' (default since 2026-09-19) is "
+             "ultralytics' ByteTrack (detection + tracking in one call, no "
+             "appearance model); 'deepsort' is the original, used by the "
+             "figures before 2026-09-19."
+    )
+    parser.add_argument(
+        "--tracker-cfg", default=default_tracker_cfg(), metavar="YAML",
+        help="ByteTrack config for --tracker bytetrack. Default: "
+             "trackers/bytetrack_rsu.yaml (lost IDs kept 3 s). "
+             "'bytetrack.yaml' selects ultralytics' stock config (1 s). "
+             "Give an absolute path: the launcher runs from the scene folder."
     )
     parser.add_argument(
         "--no-translate", action="store_true",
@@ -687,7 +695,8 @@ def main():
     # None selects ByteTrack, which lives inside model.track() rather than in a
     # tracker object of our own.
     tracker = make_deepsort() if args.tracker == "deepsort" else None
-    print(f"[INFO] tracker: {args.tracker}")
+    print(f"[INFO] tracker: {args.tracker}"
+          + (f" ({args.tracker_cfg})" if tracker is None else ""))
 
     # FPS tracking
     fps = 0.0
@@ -823,7 +832,7 @@ def main():
                 # 3+4) ByteTrack: detection and tracking in one call. persist
                 # keeps the tracker's state on the model between frames.
                 results = model.track(infer_frame, imgsz=INFER_WIDTH, persist=True,
-                                      tracker="bytetrack.yaml", verbose=False)
+                                      tracker=args.tracker_cfg, verbose=False)
                 tracks = tracks_from_boxes(results[0].boxes, scale)
             else:
                 results = model.predict(infer_frame, imgsz=INFER_WIDTH, verbose=False)

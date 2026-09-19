@@ -9,7 +9,17 @@ The detection loop reads each track through is_confirmed(), time_since_update,
 track_id, to_ltrb() and get_det_class(). Presenting ByteTrack the same way keeps
 the tracker the only difference between the two arms of an A/B.
 """
+from pathlib import Path
+
 import numpy as np
+
+
+def default_tracker_cfg():
+    """Absolute path of the shipped ByteTrack config (lost IDs kept for 3 s).
+
+    Absolute because run-bib.ps1 runs the detector from the scene folder.
+    """
+    return str(Path(__file__).resolve().parent / "trackers" / "bytetrack_rsu.yaml")
 
 
 def _arr(x):
