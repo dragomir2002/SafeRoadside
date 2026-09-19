@@ -1,5 +1,6 @@
 # Core dependencies
-numpy
+# Pinned: ultralytics' tracker check once pip-upgraded numpy on its own.
+numpy==2.4.6
 opencv-python
 
 # YOLO object detection
@@ -7,6 +8,9 @@ ultralytics
 
 # Multi-object tracking
 deep-sort-realtime
+# ByteTrack (--tracker bytetrack) needs lap; installed here so ultralytics does
+# not pip-install it, and whatever it drags in, at run time.
+lap==0.5.13
 
 # Screen capture
 mss

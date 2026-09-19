@@ -21,6 +21,7 @@ from gateway_glue import (start_gateway, publish as gw_publish,
                           start_observation_dump, stop_observation_dump,
                           record_observation_sample)
 from rsu_kinematics import KinematicsEstimator, ReplayClock, pixel_to_latlon
+from bytetrack_adapter import tracks_from_boxes
 
 # -----------------------------------------------------------------------------
 # CONFIGURAÇÃO DE LOGGING
@@ -235,12 +236,15 @@ import torch as _torch
 _DEVICE = "cuda" if _torch.cuda.is_available() else "cpu"
 print(f"[INFO] YOLO device: {_DEVICE}")
 model = YOLO("models/yolo11n.pt").to(_DEVICE) # TODO é possivel alterar ete valor para outros modelos do YOLO
-tracker = DeepSort( # TODO ver se ja outra versoes mais fortes do yolo
-    max_age=1000,
-    n_init=5,
-    nn_budget=10,
-    embedder_gpu=True
-)
+def make_deepsort():
+    """The original tracker. Built only when selected: its appearance embedder
+    loads onto the GPU, which a --tracker bytetrack run never uses."""
+    return DeepSort( # TODO ver se ja outra versoes mais fortes do yolo
+        max_age=1000,
+        n_init=5,
+        nn_budget=10,
+        embedder_gpu=True
+    )
 
 # TODO da para mudar o YOLO para outras coisas tipo modelos treinaddos so em carros
 
@@ -403,6 +407,12 @@ def parse_args():
              "'vehicles' emulates an RSU that sees traffic but not the VRU, "
              "'none' an absent RSU. The clip still drives the replay clock, and "
              "injected phone observations are unaffected."
+    )
+    parser.add_argument(
+        "--tracker", default="deepsort", choices=["deepsort", "bytetrack"],
+        help="Multi-object tracker. 'deepsort' (default) is the original and the "
+             "one every published figure used; 'bytetrack' is ultralytics' "
+             "ByteTrack (detection + tracking in one call, no appearance model)."
     )
     parser.add_argument(
         "--no-translate", action="store_true",
@@ -674,6 +684,10 @@ def is_point_far_enough(new_point, last_point, threshold=None):
 def main():
     args = parse_args()
     source = create_source(args)
+    # None selects ByteTrack, which lives inside model.track() rather than in a
+    # tracker object of our own.
+    tracker = make_deepsort() if args.tracker == "deepsort" else None
+    print(f"[INFO] tracker: {args.tracker}")
 
     # FPS tracking
     fps = 0.0
@@ -805,24 +819,31 @@ def main():
             # imgsz must be explicit: without it ultralytics letterboxes to its
             # 640 px default, discarding the 1920 resize above (on BIB_IST's
             # frame 0 that is 10 vehicles detected instead of 23).
-            results = model.predict(infer_frame, imgsz=INFER_WIDTH, verbose=False)
-            yolo_boxes = results[0].boxes
+            if tracker is None:
+                # 3+4) ByteTrack: detection and tracking in one call. persist
+                # keeps the tracker's state on the model between frames.
+                results = model.track(infer_frame, imgsz=INFER_WIDTH, persist=True,
+                                      tracker="bytetrack.yaml", verbose=False)
+                tracks = tracks_from_boxes(results[0].boxes, scale)
+            else:
+                results = model.predict(infer_frame, imgsz=INFER_WIDTH, verbose=False)
+                yolo_boxes = results[0].boxes
 
-            # 4) Converter predições YOLO para DeepSort (scale back to original)
-            detections = []
-            for box in yolo_boxes:
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
-                confidence = float(box.conf[0])
-                class_id = int(box.cls[0])
-                if scale != 1.0:
-                    x1 = int(x1 / scale)
-                    y1 = int(y1 / scale)
-                    x2 = int(x2 / scale)
-                    y2 = int(y2 / scale)
-                detections.append(([x1, y1, x2 - x1, y2 - y1], confidence, class_id))
+                # 4) Converter predições YOLO para DeepSort (scale back to original)
+                detections = []
+                for box in yolo_boxes:
+                    x1, y1, x2, y2 = map(int, box.xyxy[0])
+                    confidence = float(box.conf[0])
+                    class_id = int(box.cls[0])
+                    if scale != 1.0:
+                        x1 = int(x1 / scale)
+                        y1 = int(y1 / scale)
+                        x2 = int(x2 / scale)
+                        y2 = int(y2 / scale)
+                    detections.append(([x1, y1, x2 - x1, y2 - y1], confidence, class_id))
 
-            # 4) Atualização do tracker
-            tracks = tracker.update_tracks(detections, frame=frame)
+                # 4) Atualização do tracker
+                tracks = tracker.update_tracks(detections, frame=frame)
             current_track_ids = set()
 
             # Listas para armazenar predições futuras
