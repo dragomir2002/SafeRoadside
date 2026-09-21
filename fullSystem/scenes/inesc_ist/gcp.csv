@@ -1,0 +1,15 @@
+name,lat,lon,px,py
+"bollard base, far left",,,321,1552
+"traffic light pole base, left",,,616,1554
+"manhole cover, left pavement",,,877,1581
+"white line corner, left",,,1266,1461
+"kerb corner, island tip left",,,1425,1482
+bollard base 2,,,1530,1464
+bollard base 3,,,1731,1447
+bollard base 4,,,1958,1435
+bollard base 5,,,2172,1423
+bollard base 6,,,2399,1452
+"white line corner, right",,,2740,1552
+"manhole cover, road right",,,2994,1396
+"bollard base, right of island",,,3081,1633
+"pole base, far right",,,3579,1697
