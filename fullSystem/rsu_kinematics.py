@@ -66,6 +66,48 @@ def pixel_to_latlon(u, v, H, lat0_deg, lon0_deg):
     return lat, lon
 
 
+def camera_reference_latlon(H, lat0_deg, lon0_deg, frame_w, frame_h):
+    """Ground point at the bottom centre of the frame: the nearest road surface
+    the camera can see, and a stand-in for the camera's own position (which the
+    homography cannot give, since the camera is not on the ground plane).
+
+    Ranges are measured from here, so "beyond N metres" means N metres from the
+    RSU rather than from the arbitrary ground point chosen as the map origin.
+    """
+    return pixel_to_latlon(frame_w / 2.0, frame_h - 1.0, H, lat0_deg, lon0_deg)
+
+
+def observation_latlon(ltrb, H, lat0_deg, lon0_deg, *, ground_point="centre",
+                       max_range_m=None, reference=None):
+    """Where a detection box sits on the ground, or None if it must not be published.
+
+    `ground_point`:
+      "centre" -- the box's midpoint, which is what every figure before
+        2026-09-21 was measured with. A vehicle's centre floats ~0.75 m above
+        the road, so through a ground-plane homography it lands *beyond* the
+        vehicle; the error grows with range and with how low the camera sits.
+      "bottom" -- the middle of the box's bottom edge, i.e. where the wheels
+        meet the road, which is the point the homography actually describes.
+
+    `max_range_m` with `reference` (see camera_reference_latlon) drops anything
+    further than that. Depth resolution collapses towards the horizon -- at
+    INESC_IST one pixel row is worth 2.2 m at image row 1200 -- so a detection
+    a row above the horizon publishes at a kilometre instead of being dropped,
+    and association would pair a VRU against it. Off by default: with no limit
+    nothing is filtered, which is how BIB_IST was measured.
+    """
+    x1, y1, x2, y2 = (float(v) for v in ltrb)
+    u = (x1 + x2) / 2.0
+    v = y2 if ground_point == "bottom" else (y1 + y2) / 2.0
+    latlon = pixel_to_latlon(u, v, H, lat0_deg, lon0_deg)
+    if latlon is None or max_range_m is None or reference is None:
+        return latlon
+    lat0 = math.radians(reference[0])
+    east = math.radians(latlon[1] - reference[1]) * EARTH_R_M * math.cos(lat0)
+    north = math.radians(latlon[0] - reference[0]) * EARTH_R_M
+    return None if math.hypot(east, north) > max_range_m else latlon
+
+
 class KinematicsEstimator:
     """Speed (m/s) and compass heading (deg) per track over a scene-time baseline.
 

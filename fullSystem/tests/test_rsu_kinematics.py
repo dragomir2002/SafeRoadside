@@ -127,3 +127,58 @@ def test_prune_forgets_tracks_not_seen_recently():
     est.prune(5.0)
     assert est.update("A", 5.0, 38.7, -9.1) == (None, None)
     assert list(est._hist) == ["A"]
+
+
+# --- where a detection sits on the ground, and how far it may be (2026-09-21) --
+
+INESC_MAP = Path(__file__).resolve().parents[1] / "scenes" / "inesc_ist" / "map.txt"
+
+
+def _load_map(path):
+    rows = [l.split() for l in path.read_text().splitlines() if l.strip()]
+    return np.array([[float(v) for v in r] for r in rows[1:4]]), float(rows[0][0]), float(rows[0][1])
+
+
+def _range_m(a, b):
+    return math.hypot(math.radians(b[1] - a[1]) * R * math.cos(math.radians(a[0])),
+                      math.radians(b[0] - a[0]) * R)
+
+
+def test_the_bottom_of_the_box_is_nearer_than_its_centre():
+    """A vehicle's box centre floats ~0.75 m above the road, so through a ground
+    homography it lands beyond the vehicle. The wheels do not."""
+    from rsu_kinematics import observation_latlon, camera_reference_latlon
+    H, lat0, lon0 = _load_map(INESC_MAP)
+    ref = camera_reference_latlon(H, lat0, lon0, 3840, 2160)
+    box = (1800.0, 1200.0, 2040.0, 1280.0)        # a car out at the far road
+    centre = observation_latlon(box, H, lat0, lon0, ground_point="centre")
+    bottom = observation_latlon(box, H, lat0, lon0, ground_point="bottom")
+    assert _range_m(ref, bottom) < _range_m(ref, centre)
+
+
+def test_the_centre_is_still_the_default():
+    """Every published BIB_IST figure was measured with the centre."""
+    from rsu_kinematics import observation_latlon
+    H, lat0, lon0 = _load_map(INESC_MAP)
+    box = (1800.0, 1400.0, 2040.0, 1480.0)
+    assert observation_latlon(box, H, lat0, lon0) == \
+           observation_latlon(box, H, lat0, lon0, ground_point="centre")
+
+
+def test_a_detection_past_the_horizon_is_dropped_by_the_range_guard():
+    """INESC's horizon is around row 1130: one row above it a car publishes at
+    a kilometre, and association would pair against that."""
+    from rsu_kinematics import observation_latlon, camera_reference_latlon
+    H, lat0, lon0 = _load_map(INESC_MAP)
+    ref = camera_reference_latlon(H, lat0, lon0, 3840, 2160)
+    far = (1900.0, 1100.0, 1940.0, 1150.0)
+    assert observation_latlon(far, H, lat0, lon0) is not None          # guard off: published
+    assert observation_latlon(far, H, lat0, lon0, max_range_m=60.0, reference=ref) is None
+
+
+def test_a_normal_detection_survives_the_guard():
+    from rsu_kinematics import observation_latlon, camera_reference_latlon
+    H, lat0, lon0 = _load_map(INESC_MAP)
+    ref = camera_reference_latlon(H, lat0, lon0, 3840, 2160)
+    near = (1800.0, 1400.0, 2040.0, 1480.0)
+    assert observation_latlon(near, H, lat0, lon0, max_range_m=60.0, reference=ref) is not None

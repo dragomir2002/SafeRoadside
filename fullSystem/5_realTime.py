@@ -20,7 +20,8 @@ from gateway_glue import (start_gateway, publish as gw_publish,
                           set_rsu_publish_filter, publish_peer_observation,
                           start_observation_dump, stop_observation_dump,
                           record_observation_sample)
-from rsu_kinematics import KinematicsEstimator, ReplayClock, pixel_to_latlon
+from rsu_kinematics import (KinematicsEstimator, ReplayClock, camera_reference_latlon,
+                            observation_latlon, pixel_to_latlon)
 from bytetrack_adapter import default_tracker_cfg, tracks_from_boxes
 
 # -----------------------------------------------------------------------------
@@ -416,6 +417,20 @@ def parse_args():
              "figures before 2026-09-19."
     )
     parser.add_argument(
+        "--ground-point", default="centre", choices=["centre", "bottom"],
+        help="Which pixel of a detection box stands on the road. 'centre' "
+             "(default) is what every figure before 2026-09-19 used; 'bottom' "
+             "is the wheels, correct for a low camera where a box centre maps "
+             "tens of metres too far (scenes/inesc_ist)."
+    )
+    parser.add_argument(
+        "--max-range-m", type=float, default=None, metavar="M",
+        help="Drop detections further than this from the camera. Off by "
+             "default. Depth resolution collapses towards the horizon, so a "
+             "detection just above it publishes at a kilometre; INESC_IST "
+             "needs about 60."
+    )
+    parser.add_argument(
         "--tracker-cfg", default=default_tracker_cfg(), metavar="YAML",
         help="ByteTrack config for --tracker bytetrack. Default: "
              "trackers/bytetrack_rsu.yaml (lost IDs kept 3 s). "
@@ -694,6 +709,14 @@ def main():
     source = create_source(args)
     # None selects ByteTrack, which lives inside model.track() rather than in a
     # tracker object of our own.
+    # Ground projection policy for this scene: which pixel of a box is on the
+    # road, and how far a detection may be before the map stops meaning anything.
+    _max_range_m = args.max_range_m
+    _cam_ref = None
+    _cam_ref_resolved = False
+    print(f"[INFO] ground point: {args.ground_point}"
+          + ("" if _max_range_m is None else f", max range {_max_range_m:.0f} m"))
+
     tracker = make_deepsort() if args.tracker == "deepsort" else None
     print(f"[INFO] tracker: {args.tracker}"
           + (f" ({args.tracker_cfg})" if tracker is None else ""))
@@ -804,6 +827,19 @@ def main():
                         basic_type=sample.get("basic_type", "pedestrian"))
 
             orig_h, orig_w = frame.shape[:2]
+            if _max_range_m is not None and not _cam_ref_resolved:
+                # The nearest visible road surface, once the frame size is
+                # known. Resolved once: if it maps to the horizon there is no
+                # reference and the guard cannot run, which is said once too.
+                _cam_ref_resolved = True
+                _cam_ref = camera_reference_latlon(homography_mat, lat0_deg,
+                                                   lon0_deg, orig_w, orig_h)
+                if _cam_ref is None:
+                    print("[AVISO] --max-range-m ignored: the frame's bottom "
+                          "centre maps to the horizon, so there is no reference")
+                else:
+                    print(f"[INFO] range guard: {_max_range_m:.0f} m from "
+                          f"{_cam_ref[0]:.6f},{_cam_ref[1]:.6f}")
 
             # 1.5) Rescale the 1080p-tuned pixel thresholds to this resolution
             if not calibrated:
@@ -893,12 +929,17 @@ def main():
                 # baseline instead of one wall-clock frame step.
                 if not args.no_gateway:
                     try:
-                        # The unrounded box centre: truncating to int and
-                        # halving threw away up to a pixel, which is metres
-                        # at the ranges that set the 4-8 s band.
-                        _ll = pixel_to_latlon((ltrb[0] + ltrb[2]) / 2.0,
-                                              (ltrb[1] + ltrb[3]) / 2.0,
-                                              homography_mat, lat0_deg, lon0_deg)
+                        # Unrounded pixels: truncating to int and halving threw
+                        # away up to a pixel, which is metres at the ranges
+                        # that set the 4-8 s band. --ground-point picks which
+                        # pixel of the box stands on the road, --max-range-m
+                        # drops anything the map cannot place (see
+                        # rsu_kinematics.observation_latlon).
+                        _ll = observation_latlon(ltrb, homography_mat,
+                                                 lat0_deg, lon0_deg,
+                                                 ground_point=args.ground_point,
+                                                 max_range_m=_max_range_m,
+                                                 reference=_cam_ref)
                         if _ll is not None:
                             _spd, _hdg = kin.update(track_id, t_frame, _ll[0], _ll[1])
                             gw_publish(track_id, obj_class, _ll[0], _ll[1],
