@@ -508,7 +508,7 @@ def _publish_safewalk(lat: float, lon: float, track_id: str = "FAKE-PHONE",
     try:
         obs = Observation(
             source=_src,
-            obs_id=uuid.uuid4().hex[:8],
+            obs_id=uuid.uuid4().hex[:12],
             track_id=track_id,
             basic_type=_btype,
             lat=float(lat),
