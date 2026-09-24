@@ -23,7 +23,7 @@ are frame 3600, the emptiest frame of the clip (11 vehicles, 2 people).
 
 ## Run it
 
-The detector needs two scene-specific switches here, both added 2026-09-21:
+The detector needs two scene-specific switches here:
 
 ```powershell
 .\run-bib.ps1 -Scene inesc_ist -- --ground-point bottom --max-range-m 60

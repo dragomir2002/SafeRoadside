@@ -2,7 +2,7 @@
 
 Kept out of 5_realTime.py, which loads YOLO and DeepSort at import time and so
 cannot be imported by a test. Three defects lived in the inline version it
-replaces (review C, 2026-09-15):
+replaces:
 
 1. float32 geometry. The homography was float32 and, under NumPy 2 (NEP 50),
    the scalars stayed float32 through `Y / R + lat0`, quantising every
@@ -82,8 +82,8 @@ def observation_latlon(ltrb, H, lat0_deg, lon0_deg, *, ground_point="centre",
     """Where a detection box sits on the ground, or None if it must not be published.
 
     `ground_point`:
-      "centre" -- the box's midpoint, which is what every figure before
-        2026-09-21 was measured with. A vehicle's centre floats ~0.75 m above
+      "centre" -- the box's midpoint, which the earlier figures were
+        measured with. A vehicle's centre floats ~0.75 m above
         the road, so through a ground-plane homography it lands *beyond* the
         vehicle; the error grows with range and with how low the camera sits.
       "bottom" -- the middle of the box's bottom edge, i.e. where the wheels

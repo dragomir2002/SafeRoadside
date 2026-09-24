@@ -21,7 +21,7 @@ from gateway_glue import (start_gateway, publish as gw_publish,
                           start_observation_dump, stop_observation_dump,
                           record_observation_sample)
 from rsu_kinematics import (KinematicsEstimator, ReplayClock, camera_reference_latlon,
-                            observation_latlon, pixel_to_latlon)
+                            observation_latlon)
 from bytetrack_adapter import default_tracker_cfg, tracks_from_boxes
 
 # -----------------------------------------------------------------------------
@@ -411,15 +411,15 @@ def parse_args():
     )
     parser.add_argument(
         "--tracker", default="bytetrack", choices=["deepsort", "bytetrack"],
-        help="Multi-object tracker. 'bytetrack' (default since 2026-09-19) is "
+        help="Multi-object tracker. 'bytetrack' (default) is "
              "ultralytics' ByteTrack (detection + tracking in one call, no "
              "appearance model); 'deepsort' is the original, used by the "
-             "figures before 2026-09-19."
+             "earlier figures."
     )
     parser.add_argument(
         "--ground-point", default="centre", choices=["centre", "bottom"],
         help="Which pixel of a detection box stands on the road. 'centre' "
-             "(default) is what every figure before 2026-09-19 used; 'bottom' "
+             "(default) is the original choice; 'bottom' "
              "is the wheels, correct for a low camera where a box centre maps "
              "tens of metres too far (scenes/inesc_ist)."
     )
@@ -802,7 +802,6 @@ def main():
 
     try:
         while True:
-            t0 = time.time()
 
             # 1) Captura do frame
             frame = source.grab()
@@ -1076,17 +1075,18 @@ def main():
             # so this panel is what you actually watch a run on.
             if not args.no_hud:
                 st = get_gateway_stats()
-                phones = get_latest_safewalk()
                 now_m = time.monotonic()
 
                 idx, total = source.progress() if hasattr(source, "progress") else (frame_count, 0)
                 pos = f"{idx}/{total}" if total else f"{frame_count}"
                 cfg_name = st["config"] or "standalone"
-                cfg_col = (0, 165, 255) if "demo" in cfg_name else (200, 200, 200)
+                # Orange when a demo config is loaded: the one thing you must
+                # notice before trusting a run.
+                cfg_col = (0, 165, 255) if "demo" in cfg_name else None
 
                 WHITE, DIM = (255, 255, 255), (165, 165, 165)
                 lines = [
-                    (f"SafeCorners  {pos}   {fps:.1f} fps   [{cfg_name}]", WHITE),
+                    (f"SafeCorners  {pos}   {fps:.1f} fps   [{cfg_name}]", cfg_col or WHITE),
                     ("", DIM),
                 ]
 

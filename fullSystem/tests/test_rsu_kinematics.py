@@ -1,4 +1,4 @@
-"""RSU kinematics: the three defects found by review C, 2026-09-15.
+"""RSU kinematics: the three defects of the inline version.
 
 1. float32 homography maths quantised every published position to 0.380 m north.
 2. Speed = displacement between processed frames / WALL-clock dt, while the
@@ -129,7 +129,7 @@ def test_prune_forgets_tracks_not_seen_recently():
     assert list(est._hist) == ["A"]
 
 
-# --- where a detection sits on the ground, and how far it may be (2026-09-21) --
+# --- where a detection sits on the ground, and how far it may be ------------
 
 INESC_MAP = Path(__file__).resolve().parents[1] / "scenes" / "inesc_ist" / "map.txt"
 
