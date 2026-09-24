@@ -375,7 +375,9 @@ def publish(track_id, obj_class: str, lat: float, lon: float,
             confidence: float = 0.85,
             speed_mps: Optional[float] = None,
             heading_deg: Optional[float] = None,
-            t_recv: Optional[float] = None) -> None:
+            t_recv: Optional[float] = None,
+            accuracy_m: Optional[float] = None,
+            path=None) -> None:
     """Publish one detector track to the gateway. No-op if gateway isn't running.
 
     t_recv: the frame's capture time on the gateway clock. The detector passes
@@ -404,7 +406,8 @@ def publish(track_id, obj_class: str, lat: float, lon: float,
         "lon":         float(lon),
         "speed_mps":   speed_mps,
         "heading_deg": heading_deg,
-        "accuracy_m":  None,
+        "accuracy_m":  accuracy_m,
+        "path":        path,
         "confidence":  float(confidence),
         "t_sender":    None,
         "t_recv":      _clock() if t_recv is None else float(t_recv),

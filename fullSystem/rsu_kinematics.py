@@ -66,6 +66,99 @@ def pixel_to_latlon(u, v, H, lat0_deg, lon0_deg):
     return lat, lon
 
 
+def ground_resolution_m(u, v, H, lat0_deg, lon0_deg, dv=1.0):
+    """Metres of ground per pixel row at (u, v): the homography's own depth
+    resolution there, and therefore the position error of a detection at that
+    pixel. Returns None when either row maps to the horizon.
+
+    A ground-plane homography places a pixel exactly; what it cannot do is
+    place it *precisely* far away, because the rows crowd together towards the
+    vanishing line. At BIB_IST one row is worth centimetres near the camera and
+    metres at the far kerb. Expressing that as metres of error puts the RSU on
+    the same confidence scale as a phone's GNSS accuracy
+    (`ble_in.confidence_from_accuracy`), which is what R8 needs in order to
+    weigh the two against each other at all.
+    """
+    a = pixel_to_latlon(u, v, H, lat0_deg, lon0_deg)
+    b = pixel_to_latlon(u, v - dv, H, lat0_deg, lon0_deg)
+    if a is None or b is None:
+        return None
+    lat0 = math.radians(a[0])
+    east = math.radians(b[1] - a[1]) * EARTH_R_M * math.cos(lat0)
+    north = math.radians(b[0] - a[0]) * EARTH_R_M
+    return math.hypot(east, north) / dv
+
+
+def ground_point_error_m(ltrb, H, lat0_deg, lon0_deg):
+    """How far apart the two ground points a detection could be placed at are.
+
+    A box has no single ground truth: its centre and the middle of its bottom
+    edge both project onto the road, and they disagree by more the further away
+    the object is and the lower the camera sits (`observation_latlon` documents
+    why -- a vehicle's centre floats ~0.75 m above the road, so through a
+    ground-plane homography it lands beyond the vehicle).
+
+    That disagreement IS the position error, measured rather than modelled: it
+    needs no assumption about object height, only the homography and the box.
+    In metres, so it feeds the same curve a phone's GNSS accuracy does
+    (`ble_in.confidence_from_accuracy`) and both sources land on one scale --
+    which is what R8 needs to weigh them against each other.
+
+    Returns None when either point maps to the horizon.
+    """
+    centre = observation_latlon(ltrb, H, lat0_deg, lon0_deg, ground_point="centre")
+    bottom = observation_latlon(ltrb, H, lat0_deg, lon0_deg, ground_point="bottom")
+    if centre is None or bottom is None:
+        return None
+    lat0 = math.radians(centre[0])
+    east = math.radians(bottom[1] - centre[1]) * EARTH_R_M * math.cos(lat0)
+    north = math.radians(bottom[0] - centre[0]) * EARTH_R_M
+    return math.hypot(east, north)
+
+
+#: Range at which the camera is as good as it gets, and where it stops being
+#: worth trusting. Scene-calibrated, exactly as ble_in's ACC_FULL_M/ACC_ZERO_M
+#: are hardware-calibrated: on BIB_IST a hard cut at 40 m took the per-second
+#: alert from lift 1.00 to 1.17 and at 30 m to 1.42, so the camera's usable
+#: range ends somewhere in that band. A low mount ends sooner -- INESC_IST is
+#: usable to ~40 m against BIB_IST's ~120 m -- so these belong to the scene.
+RANGE_FULL_M = 20.0
+RANGE_ZERO_M = 60.0
+CONF_MAX = 0.95
+CONF_MIN = 0.25
+
+
+def confidence_from_range(range_m, full_m=RANGE_FULL_M, zero_m=RANGE_ZERO_M):
+    """How much to trust a detection that far from the camera, on 0..1.
+
+    The RSU publishes a constant 0.85 today, which is what leaves R8's source
+    confidence half unimplemented: a detection at 120 m, where the homography's
+    depth resolution has collapsed, is handed to fusion as exactly as
+    trustworthy as one at 15 m. Linear between the two knees, flat outside them,
+    and on the same 0.95..0.25 scale as `ble_in.confidence_from_accuracy` so the
+    camera and a phone can be weighed against each other.
+
+    None (no range available) scores CONF_MAX: absence of a measurement must not
+    masquerade as a bad one -- failing open is the lesson of the kinematics gate.
+    """
+    if range_m is None:
+        return CONF_MAX
+    if range_m <= full_m:
+        return CONF_MAX
+    if range_m >= zero_m:
+        return CONF_MIN
+    frac = (range_m - full_m) / (zero_m - full_m)
+    return CONF_MAX - frac * (CONF_MAX - CONF_MIN)
+
+
+def range_from_m(reference, lat, lon):
+    """Ground distance in metres from the camera reference to a point."""
+    lat0 = math.radians(reference[0])
+    east = math.radians(lon - reference[1]) * EARTH_R_M * math.cos(lat0)
+    north = math.radians(lat - reference[0]) * EARTH_R_M
+    return math.hypot(east, north)
+
+
 def camera_reference_latlon(H, lat0_deg, lon0_deg, frame_w, frame_h):
     """Ground point at the bottom centre of the frame: the nearest road surface
     the camera can see, and a stand-in for the camera's own position (which the

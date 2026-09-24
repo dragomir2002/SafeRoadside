@@ -21,7 +21,8 @@ from gateway_glue import (start_gateway, publish as gw_publish,
                           start_observation_dump, stop_observation_dump,
                           record_observation_sample)
 from rsu_kinematics import (KinematicsEstimator, ReplayClock, camera_reference_latlon,
-                            observation_latlon)
+                            confidence_from_range, ground_point_error_m,
+                            observation_latlon, pixel_to_latlon, range_from_m)
 from bytetrack_adapter import default_tracker_cfg, tracks_from_boxes
 
 # -----------------------------------------------------------------------------
@@ -415,6 +416,24 @@ def parse_args():
              "ultralytics' ByteTrack (detection + tracking in one call, no "
              "appearance model); 'deepsort' is the original, used by the "
              "earlier figures."
+    )
+    parser.add_argument(
+        "--rsu-path", action="store_true",
+        help=("Publish each track's predicted path to the gateway. The "
+              "detector already computes one for everything it tracks and "
+              "otherwise discards it. Pair with association.cpa: path, which "
+              "is what uses it.")
+    )
+    parser.add_argument(
+        "--rsu-confidence", default="constant", choices=["constant", "range"],
+        help=("What confidence the RSU publishes per detection. "
+              "constant (default): 0.85 for every track, near or far, "
+              "which is what every published figure was measured with "
+              "and what leaves R8's source-confidence half "
+              "unimplemented. range: graded by distance from the "
+              "camera, with the box's own placement error published "
+              "as accuracy_m. Pair it with fusion.min_confidence, "
+              "which is what actually suppresses.")
     )
     parser.add_argument(
         "--ground-point", default="centre", choices=["centre", "bottom"],
@@ -920,6 +939,22 @@ def main():
 
                 obj_class = model.names[int(track.get_det_class())]
 
+                # Predicted path, computed here rather than in the drawing
+                # section below so the gateway can be given it too. Vehicles
+                # are matched against the scene's reference trajectories,
+                # VRUs run through an EKF; association otherwise extrapolates
+                # a straight line, which at an intersection is true of almost
+                # nothing.
+                if obj_class in vehicle_classes:
+                    predicted_px = find_best_trajectory(
+                        list(point_history[track_id])[-20:], predefined_trajectories,
+                        max_points=50, score_threshold=TRAJ_SCORE_THRESHOLD)
+                elif obj_class in vru_classes:
+                    predicted_px = ekf(list(point_history[track_id])[-10:],
+                                       prediction_range=5)
+                else:
+                    predicted_px = []
+
                 # Atribui cor única
                 color = color_map.setdefault(track_id, get_random_color())
 
@@ -941,8 +976,35 @@ def main():
                                                  reference=_cam_ref)
                         if _ll is not None:
                             _spd, _hdg = kin.update(track_id, t_frame, _ll[0], _ll[1])
+                            # R8: how much to trust this detection. The camera
+                            # is not equally good everywhere -- depth
+                            # resolution collapses towards the horizon -- so
+                            # confidence falls with range and the box's own
+                            # placement error goes out as accuracy_m.
+                            _conf, _acc = 0.85, None
+                            if args.rsu_confidence == "range":
+                                _ref = _cam_ref or camera_reference_latlon(
+                                    homography_mat, lat0_deg, lon0_deg,
+                                    frame.shape[1], frame.shape[0])
+                                _conf = confidence_from_range(
+                                    range_from_m(_ref, _ll[0], _ll[1]))
+                                _acc = ground_point_error_m(ltrb, homography_mat,
+                                                            lat0_deg, lon0_deg)
+                            _path = None
+                            # len(), not truthiness: the predictors return
+                            # numpy arrays, and bool(array) raises.
+                            if args.rsu_path and len(predicted_px) > 0:
+                                _pts = [pixel_to_latlon(px, py, homography_mat,
+                                                        lat0_deg, lon0_deg)
+                                        for px, py in predicted_px]
+                                _pts = [q for q in _pts if q is not None]
+                                if _pts:
+                                    # Starts at where the object is now, so the
+                                    # gateway can walk it by arc length.
+                                    _path = tuple([(_ll[0], _ll[1])] + _pts)
                             gw_publish(track_id, obj_class, _ll[0], _ll[1],
-                                       speed_mps=_spd, heading_deg=_hdg, t_recv=t_frame)
+                                       speed_mps=_spd, heading_deg=_hdg, t_recv=t_frame,
+                                       confidence=_conf, accuracy_m=_acc, path=_path)
                             record_observation_sample(
                                 frame_index=source.frames_read - 1, source="RSU",
                                 track_id=str(track_id), basic_type=obj_class,
@@ -972,18 +1034,14 @@ def main():
                 # 6) Gera predições futuras
                 if obj_class in vehicle_classes:
                     n_vehicles += 1
-                    past_points = list(point_history[track_id])[-20:]
-                    best_traj = find_best_trajectory(
-                        past_points, predefined_trajectories, max_points=50,
-                        score_threshold=TRAJ_SCORE_THRESHOLD)
+                    best_traj = predicted_px
                     for pt in best_traj:
                         cv2.circle(frame, (int(pt[0]), int(pt[1])), max(5, int(5 * DRAW_SCALE)), color, -1)
                     future_car_points.extend(best_traj)
 
                 elif obj_class in vru_classes:
                     n_vrus += 1
-                    past_points = list(point_history[track_id])[-10:]
-                    pred_points = ekf(past_points, prediction_range=5)
+                    pred_points = predicted_px
                     for pt in pred_points:
                         cv2.circle(frame, (int(pt[0]), int(pt[1])), max(5, int(5 * DRAW_SCALE)), color, -1)
                     future_vru_points.extend(pred_points)
