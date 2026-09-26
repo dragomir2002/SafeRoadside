@@ -377,8 +377,13 @@ def publish(track_id, obj_class: str, lat: float, lon: float,
             heading_deg: Optional[float] = None,
             t_recv: Optional[float] = None,
             accuracy_m: Optional[float] = None,
-            path=None) -> None:
+            path=None,
+            flagged_with=None,
+            range_m: Optional[float] = None) -> None:
     """Publish one detector track to the gateway. No-op if gateway isn't running.
+
+    flagged_with: tracks the RSU's own collision check flagged this one against
+    (its verdict, used by fusion only when unconfirmed_rsu_factor < 1).
 
     t_recv: the frame's capture time on the gateway clock. The detector passes
     one value for every track of a frame; stamping each track as it is
@@ -408,6 +413,8 @@ def publish(track_id, obj_class: str, lat: float, lon: float,
         "heading_deg": heading_deg,
         "accuracy_m":  accuracy_m,
         "path":        path,
+        "flagged_with": list(flagged_with or ()),
+        "range_m":     None if range_m is None else float(range_m),
         "confidence":  float(confidence),
         "t_sender":    None,
         "t_recv":      _clock() if t_recv is None else float(t_recv),
@@ -703,9 +710,10 @@ class AnchorTranslator:
     user becomes two warning streams .
 
     Junk fixes are dropped in both modes, and a dropped fix must not become
-    home: SafeWalk emits the placeholder (12.34, 56.78) before its first GPS
-    lock, and accepting it as home would shove every later position ~7000 km
-    off-frame.
+    home: SafeWalk emits a placeholder before its first GPS lock, and accepting
+    it as home would shove every later position off-frame -- ~7000 km for the
+    original (12.34, 56.78), the distance to the phone's real position for the
+    BIB_IST test point.
     """
 
     R_EARTH_M = 6_371_000.0
@@ -719,7 +727,11 @@ class AnchorTranslator:
 
     @staticmethod
     def is_junk(lat: float, lon: float) -> bool:
+        # SafeWalk's placeholders: the original, and the BIB_IST test point it
+        # sends now -- the latter matched to PSM resolution (1e-7 deg), so a
+        # real or simulated fix a metre away still passes.
         return bool((abs(lat - 12.34) < 1e-3 and abs(lon - 56.78) < 1e-3)
+                    or (abs(lat - 38.7367524) < 5e-7 and abs(lon + 9.1437386) < 5e-7)
                     or (abs(lat) < 1e-6 and abs(lon) < 1e-6)
                     or not (-90.0 <= lat <= 90.0)
                     or not (-180.0 <= lon <= 180.0))

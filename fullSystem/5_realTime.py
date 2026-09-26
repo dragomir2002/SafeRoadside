@@ -24,6 +24,9 @@ from rsu_kinematics import (KinematicsEstimator, ReplayClock, camera_reference_l
                             confidence_from_range, ground_point_error_m,
                             observation_latlon, pixel_to_latlon, range_from_m)
 from bytetrack_adapter import default_tracker_cfg, tracks_from_boxes
+from capture_fit import fit_frame, parse_size
+from rsu_conflicts import conflict_pairs
+import json
 
 # -----------------------------------------------------------------------------
 # CONFIGURAÇÃO DE LOGGING
@@ -346,6 +349,19 @@ def parse_args():
         )
     )
     parser.add_argument(
+        "--rsu-conflict-log", type=str, default=None, metavar="PATH",
+        help="Write one JSON line per (vehicle, VRU) track pair the RSU's own\n"
+             "pixel collision check flags, per frame (the red blobs). Recorded\n"
+             "sources only. Logging only: nothing else changes."
+    )
+    parser.add_argument(
+        "--capture-size", type=str, default=None, metavar="WxH",
+        help="Resize every screen-captured frame to WxH, the size the scene was\n"
+             "calibrated at (3840x2160 for both scenes). A 4K video played\n"
+             "full-screen on a 1920x1080 monitor is otherwise projected from\n"
+             "half its pixel coordinates. Screen sources only."
+    )
+    parser.add_argument(
         "--loop", action="store_true",
         help="Loop video file when it ends (only for --source video)"
     )
@@ -526,15 +542,18 @@ class VideoSource:
 
 class ScreenSource:
     """Captures a specific monitor or screen region via mss."""
-    def __init__(self, region):
+    def __init__(self, region, size=None):
         self.sct = mss()
         self.region = region
+        self.size = size
+        self.frames_read = 0
 
     def grab(self):
+        self.frames_read += 1
         screenshot = self.sct.grab(self.region)
         frame = np.array(screenshot, dtype=np.uint8)
         frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
-        return frame
+        return fit_frame(frame, self.size)
 
     def release(self):
         pass
@@ -569,11 +588,14 @@ def pick_monitor_interactive():
 def create_source(args):
     """Factory: builds the right source from CLI arguments."""
     source_str = args.source
+    size = parse_size(args.capture_size) if args.capture_size else None
+    if size:
+        print(f"[INFO] screen frames resized to {size[0]}x{size[1]} (--capture-size)")
 
     # No argument → interactive monitor picker
     if source_str is None:
         region = pick_monitor_interactive()
-        return ScreenSource(region)
+        return ScreenSource(region, size)
 
     # monitor:N
     if source_str.startswith("monitor:"):
@@ -587,7 +609,7 @@ def create_source(args):
             sys.exit(1)
         m = sct.monitors[idx]
         print(f"[INFO] Source: monitor {idx} ({m['width']}x{m['height']})")
-        return ScreenSource(m)
+        return ScreenSource(m, size)
 
     # region:X,Y,W,H
     if source_str.startswith("region:"):
@@ -595,9 +617,12 @@ def create_source(args):
         x, y, w, h = int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3])
         region = {"top": y, "left": x, "width": w, "height": h}
         print(f"[INFO] Source: screen region {w}x{h} at ({x},{y})")
-        return ScreenSource(region)
+        return ScreenSource(region, size)
 
     # Otherwise → video file
+    if size:
+        print("[ERRO] --capture-size applies to screen capture only")
+        sys.exit(2)
     return VideoSource(source_str, loop=args.loop)
 
 
@@ -726,6 +751,14 @@ def is_point_far_enough(new_point, last_point, threshold=None):
 def main():
     args = parse_args()
     source = create_source(args)
+    rsu_flags = {}   # track id -> tracks the RSU's own check flagged it against
+    _range_ref = None   # camera reference for range_m, resolved on first use
+    conflict_log = None
+    if args.rsu_conflict_log:
+        if not isinstance(source, VideoSource):
+            print("[ERRO] --rsu-conflict-log needs a recorded source")
+            sys.exit(2)
+        conflict_log = open(args.rsu_conflict_log, "w", encoding="utf-8", buffering=1)
     # None selects ByteTrack, which lives inside model.track() rather than in a
     # tracker object of our own.
     # Ground projection policy for this scene: which pixel of a box is on the
@@ -912,6 +945,7 @@ def main():
             # Listas para armazenar predições futuras
             future_car_points = []
             future_vru_points = []   # pedestrians AND cyclists
+            future_car_owner, future_vru_owner = [], []   # track id per point
             n_vehicles = n_vrus = 0  # this frame, for the HUD
             n_collisions = 0
 
@@ -1002,9 +1036,19 @@ def main():
                                     # Starts at where the object is now, so the
                                     # gateway can walk it by arc length.
                                     _path = tuple([(_ll[0], _ll[1])] + _pts)
+                            # Distance from the camera, so the gateway can
+                            # limit camera-only pairs by range and still pair a
+                            # far vehicle with a pedestrian on a phone.
+                            if _range_ref is None:
+                                _range_ref = _cam_ref or camera_reference_latlon(
+                                    homography_mat, lat0_deg, lon0_deg,
+                                    frame.shape[1], frame.shape[0])
                             gw_publish(track_id, obj_class, _ll[0], _ll[1],
                                        speed_mps=_spd, heading_deg=_hdg, t_recv=t_frame,
-                                       confidence=_conf, accuracy_m=_acc, path=_path)
+                                       confidence=_conf, accuracy_m=_acc, path=_path,
+                                       flagged_with=rsu_flags.get(str(track_id)),
+                                       range_m=(range_from_m(_range_ref, _ll[0], _ll[1])
+                                                if _range_ref else None))
                             record_observation_sample(
                                 frame_index=source.frames_read - 1, source="RSU",
                                 track_id=str(track_id), basic_type=obj_class,
@@ -1038,6 +1082,7 @@ def main():
                     for pt in best_traj:
                         cv2.circle(frame, (int(pt[0]), int(pt[1])), max(5, int(5 * DRAW_SCALE)), color, -1)
                     future_car_points.extend(best_traj)
+                    future_car_owner.extend([track_id] * len(best_traj))
 
                 elif obj_class in vru_classes:
                     n_vrus += 1
@@ -1045,6 +1090,7 @@ def main():
                     for pt in pred_points:
                         cv2.circle(frame, (int(pt[0]), int(pt[1])), max(5, int(5 * DRAW_SCALE)), color, -1)
                     future_vru_points.extend(pred_points)
+                    future_vru_owner.extend([track_id] * len(pred_points))
 
             kin.prune(t_frame)   # forget tracks unseen for more than max_gap_s
 
@@ -1108,6 +1154,24 @@ def main():
                                     main._outbox_warned = True
                             except OSError as e:
                                 print(f"[AVISO] could not update {file_path}: {e}")
+
+            # 7.1) The pairs step 7 flagged, per track: published with the NEXT
+            # frame's observations (step 7 runs after publishing, so the verdict
+            # lags by one frame), and optionally logged for scoring.
+            _flagged = conflict_pairs(future_car_points, future_car_owner,
+                                      future_vru_points, future_vru_owner,
+                                      COLLISION_THRESHOLD)
+            rsu_flags = {}
+            for (veh, vru_tid) in _flagged:
+                rsu_flags.setdefault(str(veh), []).append(str(vru_tid))
+                rsu_flags.setdefault(str(vru_tid), []).append(str(veh))
+            if conflict_log is not None:
+                for (veh, vru_tid), d_px in _flagged.items():
+                    conflict_log.write(json.dumps({
+                        "frame": source.frames_read - 1,
+                        "t_video": round((source.frames_read - 1) / source.fps, 4),
+                        "veh": str(veh), "vru": str(vru_tid),
+                        "min_px": round(d_px, 1)}) + "\n")
 
             # 7.5) SafeWalk avatar overlay -- draw "YOU" markers for any
             # phone that has published a PSM in the last ~2 s. Maps lat/lon

@@ -46,6 +46,7 @@ def test_translation_off_returns_the_real_position_unchanged():
 
 @pytest.mark.parametrize("lat,lon,why", [
     (12.34, 56.78, "SafeWalk's pre-fix placeholder"),
+    (38.7367524, -9.1437386, "SafeWalk's pre-fix placeholder, BIB_IST test point"),
     (0.0, 0.0, "Null Island"),
     (91.0, 0.0, "latitude out of range"),
     (0.0, 181.0, "longitude out of range"),
@@ -61,6 +62,21 @@ def test_a_dropped_first_fix_does_not_become_home():
     t = AnchorTranslator(ANCHOR_LAT, ANCHOR_LON)
     assert t(12.34, 56.78) is None
     assert t(HOME_LAT, HOME_LON) == (ANCHOR_LAT, ANCHOR_LON)
+
+
+def test_the_scene_placeholder_does_not_become_home_either():
+    """SafeWalk always sends its placeholder first. Taken as home, a real walk
+    10 km away would then land 10 km off the scene."""
+    t = AnchorTranslator(ANCHOR_LAT, ANCHOR_LON)
+    assert t(38.7367524, -9.1437386) is None
+    assert t(HOME_LAT, HOME_LON) == (ANCHOR_LAT, ANCHOR_LON)
+
+
+def test_a_real_fix_a_metre_from_the_scene_placeholder_is_kept():
+    """Only the exact placeholder is junk: a simulated or real fix beside it is not."""
+    t = AnchorTranslator(ANCHOR_LAT, ANCHOR_LON, translate=False)
+    one_m_north = 38.7367524 + math.degrees(1.0 / R_EARTH)
+    assert t(one_m_north, -9.1437386) == (one_m_north, -9.1437386)
 
 
 # --- the flag has to survive the whole POST path, not just the class -------
