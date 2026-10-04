@@ -13,7 +13,7 @@ import os
 import argparse
 import time
 
-from gateway_glue import (start_gateway, publish as gw_publish,
+from gateway_glue import (start_gateway, publish as gw_publish, publish_script_sample,
                           start_safewalk_injector, start_safewalk_http_bridge,
                           get_latest_safewalk, get_gateway_stats,
                           set_verbose_pedestrians, wait_gateway_idle,
@@ -865,17 +865,18 @@ def main():
             t_frame = clock()   # ONE capture time for every track of this frame
 
             # Scripted actors ride the same clock as the detector's own tracks,
-            # so a constructed conflict happens at a known second of video.
+            # so a constructed conflict happens at a known second of video. An
+            # actor with "source": "RSU" is published as a camera track would be.
             if vru is not None:
                 for sample in vru.due((source.frames_read - 1) / clock.fps):
-                    publish_peer_observation(
-                        lat=float(sample["lat"]), lon=float(sample["lon"]),
-                        track_id=str(sample.get("track_id", "SCRIPT-VRU")),
-                        speed_mps=sample.get("speed_mps"),
-                        heading_deg=sample.get("heading_deg"),
-                        accuracy_m=sample.get("accuracy_m", 3.0),
-                        source=sample.get("source", "SafeWalk"),
-                        basic_type=sample.get("basic_type", "pedestrian"))
+                    if sample.get("source") == "RSU" and _range_ref is None:
+                        _range_ref = _cam_ref or camera_reference_latlon(
+                            homography_mat, lat0_deg, lon0_deg,
+                            frame.shape[1], frame.shape[0])
+                    publish_script_sample(
+                        sample, t_recv=t_frame,
+                        range_of=((lambda la, lo: range_from_m(_range_ref, la, lo))
+                                  if _range_ref else None))
 
             orig_h, orig_w = frame.shape[:2]
             if _max_range_m is not None and not _cam_ref_resolved:

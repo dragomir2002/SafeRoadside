@@ -423,6 +423,36 @@ def publish(track_id, obj_class: str, lat: float, lon: float,
         print(f"[GW] pedestrian track {track_id} at lat={lat:.7f}, lon={lon:.7f}")
 
 
+_SCRIPT_CLASS = {"vehicle": "car", "pedestrian": "person", "cyclist": "bicycle"}
+
+
+def publish_script_sample(sample: dict, t_recv: float, range_of=None) -> None:
+    """Publish one scripted-actor sample along the path its `source` names.
+
+    "RSU": as a detector track -- the RSU adapter, the frame's capture time,
+    the range from the camera (`range_of(lat, lon)`), no GNSS accuracy -- so a
+    constructed conflict can test what the camera alone would do. Anything
+    else (default "SafeWalk"): as a phone report, which is what every scripted
+    actor was before.
+    """
+    source = sample.get("source", "SafeWalk")
+    lat, lon = float(sample["lat"]), float(sample["lon"])
+    track_id = str(sample.get("track_id", "SCRIPT-VRU"))
+    basic_type = sample.get("basic_type", "pedestrian")
+    if source == "RSU":
+        publish(track_id, _SCRIPT_CLASS[basic_type], lat, lon,
+                speed_mps=sample.get("speed_mps"),
+                heading_deg=sample.get("heading_deg"),
+                t_recv=t_recv,
+                range_m=range_of(lat, lon) if range_of else None)
+        return
+    publish_peer_observation(lat=lat, lon=lon, track_id=track_id,
+                             speed_mps=sample.get("speed_mps"),
+                             heading_deg=sample.get("heading_deg"),
+                             accuracy_m=sample.get("accuracy_m", 3.0),
+                             source=source, basic_type=basic_type)
+
+
 _last_you_print = [0.0]  # mutable cell so the closure can update it
 
 
