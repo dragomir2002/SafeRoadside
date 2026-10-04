@@ -1,8 +1,4 @@
-"""The RSU tells the gateway how far each detection is from the camera.
-
-The gateway can then apply the camera's range limit to camera-only pairs and
-still pair a far vehicle with a pedestrian who reports herself by phone.
-"""
+"""The RSU tells the gateway how far each detection is from the camera."""
 import gateway_glue
 
 

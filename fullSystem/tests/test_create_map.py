@@ -1,5 +1,4 @@
-"""0_createMap.py --points: calibration from a points file instead of hardcoded
-coordinates and clicks, with a quality figure per point."""
+"""0_createMap.py --points: calibration from a points file."""
 import importlib.util
 import math
 from pathlib import Path
@@ -59,9 +58,7 @@ def test_a_gross_misclick_is_flagged_and_does_not_spoil_the_others():
 
 
 def test_a_small_misclick_passes_ransac_but_leave_one_out_singles_it_out():
-    """300 px here is ~3.3 m on the ground, under RANSAC's 5 m: it stays an
-    inlier and bends the fit for every point, so only its leave-one-out error
-    gives it away."""
+    """A 300 px misclick stays a RANSAC inlier; leave-one-out shows it."""
     pixels = list(PIXELS)
     pixels[5] = (pixels[5][0] + 300, pixels[5][1])
     fit = create_map.fit_map(pixels, LATLONS)
@@ -81,7 +78,7 @@ def test_points_file_blank_pixels_are_none(tmp_path):
 
 
 def test_coordinate_strings_parse_with_their_hemisphere():
-    """The coords_str form, as pasted from Google Earth: west and south negative."""
+    """The coords_str form: west and south negative."""
     assert create_map.parse_latlon("38.736407°N 9.143549°W") == (38.736407, -9.143549)
     assert create_map.parse_latlon("38.736407N 9.143549E") == (38.736407, 9.143549)
     assert create_map.parse_latlon("1.5°S 2.25°W") == (-1.5, -2.25)

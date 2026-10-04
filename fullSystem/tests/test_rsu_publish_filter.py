@@ -1,21 +1,11 @@
-"""The detector can withhold its own observations, to emulate RSU degradation.
-
-R5 asks what happens when the RSU is occluded. On recorded footage the camera
-cannot be covered, so the publish path is filtered instead: the clip still drives
-the replay clock, and the gateway sees only what the mode allows.
-"""
+"""The detector can withhold its own observations, to emulate an absent RSU."""
 import pytest
 
 import gateway_glue
 
 
 def _basic_types(seen):
-    """The two publish paths hand over different shapes.
-
-    `publish()` (the detector's own tracks) calls adapter.publish_observation()
-    with a plain dict; `publish_peer_observation()` puts a built Observation on
-    ingest_q. Both are captured, so normalise.
-    """
+    """The two publish paths hand over different shapes; normalise both."""
     return {s["basic_type"] if isinstance(s, dict) else s.basic_type for s in seen}
 
 
@@ -77,11 +67,7 @@ def test_an_unknown_filter_mode_is_refused(captured):
 
 
 def test_the_filter_does_not_touch_injected_peer_observations(captured):
-    """A phone is not the RSU: 'none' must not silence the cooperative path.
-
-    This is the whole point of mode 'none' -- it emulates an absent RSU while
-    the scripted or real phone keeps reporting.
-    """
+    """The filter does not apply to injected phone observations."""
     gateway_glue.set_rsu_publish_filter("none")
     gateway_glue.publish_peer_observation(
         lat=38.736407, lon=-9.143549, track_id="PED-1", speed_mps=1.4,

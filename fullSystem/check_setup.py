@@ -1,8 +1,5 @@
 #!/usr/bin/env python3
-"""
-check_setup.py — Validates that the fullSystem environment is correctly set up.
-Run this before using any of the pipeline scripts.
-"""
+"""Check that the files and packages the pipeline needs are present."""
 import sys
 
 def check(name, import_fn):

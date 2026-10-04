@@ -1,10 +1,4 @@
-"""RSU kinematics: the three defects of the inline version.
-
-1. float32 homography maths quantised every published position to 0.380 m north.
-2. Speed = displacement between processed frames / WALL-clock dt, while the
-   detector replays a 29.97 fps recording ~5.2x slower than real time.
-3. Heading was None whenever a frame-to-frame step was <= 5 cm.
-"""
+"""RSU kinematics: float64 geometry, scene-time speed, compass heading."""
 import math
 import random
 from pathlib import Path
@@ -27,8 +21,7 @@ def _scene():
 
 
 def test_single_pixel_steps_are_resolved_even_from_a_float32_matrix():
-    """Down one image column near the calibrated area, each pixel is ~3.6-4.2 cm
-    north (float64). The shipped float32 path published 0 or -0.3797 m."""
+    """Near the calibrated area one pixel is about 4 cm north."""
     lat0, lon0, H = _scene()
     prev = None
     for v in range(1400, 1440):
@@ -101,15 +94,14 @@ def test_jitter_on_a_still_body_stays_below_the_stationary_threshold():
 
 
 def test_a_slow_walker_gets_a_heading():
-    """1.3 m/s is above the stationary threshold: it must not read as unknown."""
+    """1.3 m/s is above the stationary threshold."""
     speed, heading = _drive(KinematicsEstimator(), 1, 1.3, 0.0)
     assert speed == pytest.approx(1.3, rel=0.01) and heading is not None
 
 
 @pytest.mark.parametrize("bearing", [45.0, 90.0, 135.0, 225.0, 270.0, 315.0])
 def test_heading_is_a_compass_bearing_in_every_quadrant(bearing):
-    """Round 2 (B6): a mutation that dropped every heading between 180 and 360
-    degrees survived, because only 0 and 90 were tested."""
+    """Headings in all four quadrants."""
     _, heading = _drive(KinematicsEstimator(), 1, 5.0, bearing)
     assert heading == pytest.approx(bearing, abs=0.5)
     assert 0.0 <= heading < 360.0
@@ -145,8 +137,7 @@ def _range_m(a, b):
 
 
 def test_the_bottom_of_the_box_is_nearer_than_its_centre():
-    """A vehicle's box centre floats ~0.75 m above the road, so through a ground
-    homography it lands beyond the vehicle. The wheels do not."""
+    """The bottom of a box is on the road; its centre is above it."""
     from rsu_kinematics import observation_latlon, camera_reference_latlon
     H, lat0, lon0 = _load_map(INESC_MAP)
     ref = camera_reference_latlon(H, lat0, lon0, 3840, 2160)
@@ -157,7 +148,6 @@ def test_the_bottom_of_the_box_is_nearer_than_its_centre():
 
 
 def test_the_centre_is_still_the_default():
-    """Every published BIB_IST figure was measured with the centre."""
     from rsu_kinematics import observation_latlon
     H, lat0, lon0 = _load_map(INESC_MAP)
     box = (1800.0, 1400.0, 2040.0, 1480.0)
@@ -166,13 +156,12 @@ def test_the_centre_is_still_the_default():
 
 
 def test_a_detection_past_the_horizon_is_dropped_by_the_range_guard():
-    """INESC's horizon is around row 1130: one row above it a car publishes at
-    a kilometre, and association would pair against that."""
+    """A detection just above the horizon would publish a kilometre away."""
     from rsu_kinematics import observation_latlon, camera_reference_latlon
     H, lat0, lon0 = _load_map(INESC_MAP)
     ref = camera_reference_latlon(H, lat0, lon0, 3840, 2160)
     far = (1900.0, 1100.0, 1940.0, 1150.0)
-    assert observation_latlon(far, H, lat0, lon0) is not None          # guard off: published
+    assert observation_latlon(far, H, lat0, lon0) is not None  # guard off
     assert observation_latlon(far, H, lat0, lon0, max_range_m=60.0, reference=ref) is None
 
 

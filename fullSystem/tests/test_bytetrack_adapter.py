@@ -1,9 +1,4 @@
-"""ByteTrack (ultralytics model.track) presented through DeepSort's track interface.
-
-The detection loop reads each track through is_confirmed(), time_since_update,
-track_id, to_ltrb() and get_det_class(). Keeping that interface means the
-tracker is the only thing that changes between the two arms of the A/B.
-"""
+"""ByteTrack presented through DeepSort's track interface."""
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -22,7 +17,7 @@ def _boxes(ids, xyxy, cls):
 
 def test_boxes_become_tracks_in_original_frame_pixels():
     b = _boxes([7, 12], [[100, 50, 140, 90], [10, 20, 30, 60]], [2, 0])
-    tracks = tracks_from_boxes(b, scale=0.5)      # inference frame was half size
+    tracks = tracks_from_boxes(b, scale=0.5)  # inference at half size
     assert [t.track_id for t in tracks] == ["7", "12"]
     assert tracks[0].to_ltrb() == pytest.approx([200, 100, 280, 180])
     assert [t.get_det_class() for t in tracks] == [2, 0]
@@ -58,14 +53,14 @@ def test_torch_like_tensors_are_accepted():
 
 
 def test_default_tracker_cfg_is_an_existing_absolute_path():
-    """run-bib.ps1 cd's into the scene folder, so a relative name would not resolve."""
+    """run-bib.ps1 runs from the scene folder, so the path must be absolute."""
     path = Path(default_tracker_cfg())
     assert path.is_absolute()
     assert path.is_file()
 
 
 def test_shipped_cfg_keeps_lost_ids_3_s_and_is_stock_otherwise():
-    """Only track_buffer differs from ultralytics' cfg/trackers/bytetrack.yaml."""
+    """Only track_buffer differs from ultralytics' bytetrack.yaml."""
     cfg = yaml.safe_load(Path(default_tracker_cfg()).read_text(encoding="utf-8"))
     assert cfg == {
         "tracker_type": "bytetrack",

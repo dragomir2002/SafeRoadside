@@ -1,11 +1,4 @@
-"""Scripted actors, replayed in scene time.
-
-Ground truth for the labelled trials: the script says where each actor is at
-each second of video, so a conflict exists by construction instead of being
-inferred from the system's own output. Scene time, not wall time -- a wall-clock
-avatar drifts against replayed video by the replay slow-down (~9x on the
-reference machine).
-"""
+"""Scripted actors, replayed in scene time."""
 import json
 
 import pytest
@@ -22,7 +15,7 @@ def _script(tmp_path, samples, name="s.jsonl"):
 # --- single actor (the accuracy-plan scenarios) -----------------------------
 
 def test_latest_due_skips_stale_samples_and_never_repeats(tmp_path):
-    """One publish per frame: at t=1.0 the 0.9 sample is current, 0.1 is history."""
+    """At t=1.0 the 0.9 sample is current and 0.1 is history."""
     s = VruScript.load(_script(tmp_path, [
         {"t": 0.1, "lat": 1.0, "lon": 2.0},
         {"t": 0.9, "lat": 1.1, "lon": 2.1},
@@ -58,7 +51,7 @@ def test_load_rejects_an_empty_script(tmp_path):
         VruScript.load(p)
 
 
-# --- several actors at once (R5 mode M3: a scripted car AND a scripted VRU) --
+# --- several actors at once ---
 
 def test_due_returns_the_newest_sample_for_each_actor(tmp_path):
     """A vehicle and a pedestrian in one script, no cross-talk."""
@@ -85,11 +78,7 @@ def test_due_advances_each_actor_independently(tmp_path):
 
 
 def test_latest_due_and_due_share_progress_so_nothing_publishes_twice(tmp_path):
-    """Two ingest paths for one avatar is the double-counting trap .
-
-    A caller that used both methods must not be able to publish the same
-    position twice, so a sample consumed by either is spent for both.
-    """
+    """A sample consumed by either method is spent for both."""
     s = VruScript.load(_script(tmp_path, [{"t": 1.0, "lat": 1.0, "lon": 2.0}]))
     assert s.latest_due(1.0)["lat"] == 1.0
     assert s.due(1.0) == []

@@ -1,11 +1,4 @@
-"""Scripted actors can be seen by the camera as well as reported by a phone.
-
-A constructed conflict tests the gateway only on the path its actor takes. A
-phone actor never exercises what the camera alone would do -- the range limits,
-a pedestrian hidden behind a pole, a detection that arrives late -- so a script
-sample with "source": "RSU" is published exactly as a detector track is: through
-the RSU adapter, with the frame's capture time and its range from the camera.
-"""
+"""Scripted actors published as camera tracks or as phone reports."""
 import gateway_glue
 
 

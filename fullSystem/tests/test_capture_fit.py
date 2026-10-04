@@ -1,9 +1,4 @@
-"""A screen capture must reach the pipeline at the size the scene was calibrated at.
-
-The homography maps pixels of the recorded frame (3840x2160 for both scenes).
-A 4K video shown full-screen on a 1920x1080 monitor is captured at half that,
-so every detection would be projected from half its pixel coordinates.
-"""
+"""A screen capture reaches the pipeline at the calibrated frame size."""
 import numpy as np
 import pytest
 

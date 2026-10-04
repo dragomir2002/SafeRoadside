@@ -1,15 +1,4 @@
-"""
-Step 4 - Downsample and smooth the reference trajectories.
-
-Reads trajetorias.txt, drops points that sit closer than --min-distance to the
-previously kept point, then applies a moving-average filter, and writes
-trajetoriasClean.txt.
-
---min-distance is expressed in pixels, so it depends on the resolution of the
-scene imagery. The original value of 20 px was chosen for 1080p; on a 4K scene
-pass roughly double (40) to keep the same real-world spacing. --reference-width
-does that scaling automatically.
-"""
+"""Step 4: downsample and smooth the reference trajectories."""
 import argparse
 import math
 import os
@@ -83,8 +72,7 @@ def main():
                 continue
             total_in += len(points)
 
-            # Downsample: keep a point only once it is far enough from the
-            # last kept one.
+            # Keep a point once it is far enough from the last kept one.
             selected = []
             last = None
             for point in points:

@@ -1,10 +1,4 @@
-"""The detector can dump exactly what it published, in video time.
-
-The gateway log carries no coordinates -- its associate records hold dist_m and
-closing_ttc_s but no lat/lon -- so this is the only record of where the detector
-actually put each track. Scenario authoring needs it: a constructed conflict has
-to meet a REAL recorded vehicle at a real place and time.
-"""
+"""The detector can dump what it published, in video time."""
 import gateway_glue
 
 
@@ -37,13 +31,7 @@ def test_unknown_speed_and_heading_are_written_as_empty_fields(tmp_path):
 
 
 def test_detector_classes_are_recorded_as_canonical_types(tmp_path):
-    """The CSV must speak the gateway's vocabulary, not YOLO's.
-
-    The detector publishes obj_class ("car", "person", "bicycle"); association
-    and the script format use basic_type ("vehicle", "pedestrian", "cyclist").
-    A scenario author filtering the dump for vehicles must not have to know
-    which COCO classes count as one.
-    """
+    """The CSV uses basic_type names, not YOLO class names."""
     out = tmp_path / "obs.csv"
     gateway_glue.start_observation_dump(out, fps=30.0)
     try:

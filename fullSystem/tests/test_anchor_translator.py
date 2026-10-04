@@ -1,12 +1,4 @@
-"""Real-world phone coordinates -> what the gateway is told.
-
-On recorded footage the bridge transplants the phone's motion onto the scene:
-the first fix becomes "home" and maps to the video anchor, and later fixes are
-applied as deltas. In a FIELD trial that is wrong -- the phone is already
-inside the calibrated scene, so translating it displaces the avatar by
-(first fix - map origin) and the RSU's own detection of the same person can
-never be associated with it.
-"""
+"""Real phone coordinates and what the gateway is told (AnchorTranslator)."""
 import math
 import time
 
@@ -65,15 +57,14 @@ def test_a_dropped_first_fix_does_not_become_home():
 
 
 def test_the_scene_placeholder_does_not_become_home_either():
-    """SafeWalk always sends its placeholder first. Taken as home, a real walk
-    10 km away would then land 10 km off the scene."""
+    """The placeholder SafeWalk sends first is not taken as home."""
     t = AnchorTranslator(ANCHOR_LAT, ANCHOR_LON)
     assert t(38.7367524, -9.1437386) is None
     assert t(HOME_LAT, HOME_LON) == (ANCHOR_LAT, ANCHOR_LON)
 
 
 def test_a_real_fix_a_metre_from_the_scene_placeholder_is_kept():
-    """Only the exact placeholder is junk: a simulated or real fix beside it is not."""
+    """Only the exact placeholder is dropped."""
     t = AnchorTranslator(ANCHOR_LAT, ANCHOR_LON, translate=False)
     one_m_north = 38.7367524 + math.degrees(1.0 / R_EARTH)
     assert t(one_m_north, -9.1437386) == (one_m_north, -9.1437386)
@@ -83,7 +74,7 @@ def test_a_real_fix_a_metre_from_the_scene_placeholder_is_kept():
 
 @pytest.fixture
 def bridge_post():
-    """Start the real bridge on a free port, capture what reaches the gateway."""
+    """Start the bridge on a free port and capture what reaches the gateway."""
     import json
     import socket
     import urllib.request

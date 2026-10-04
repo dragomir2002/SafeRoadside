@@ -1,20 +1,4 @@
-"""
-Step 2 - Auto-detect vehicle guide trajectories.
-
-Runs YOLO + DeepSort over an input source and records the centre-point pixel
-path of every tracked vehicle. On exit the paths are overlaid on road.png and
-saved as withguide.png (input for step 3).
-
-Sources:
-    --source path/to/video.mp4   a video file  (coords land in video pixel space)
-    --source monitor:N           capture monitor N
-    --source region:X,Y,W,H      capture a screen region
-    (omit)                       interactive monitor picker
-
-IMPORTANT: the recorded points must share a coordinate space with road.png and
-map.txt. When calibration was done on frames of a video, pass that video with
---source rather than capturing it through a (differently-sized) screen.
-"""
+"""Step 2: record the path of every tracked vehicle and draw it on road.png."""
 import cv2
 import numpy as np
 from mss import mss
@@ -165,8 +149,7 @@ def main():
 
     source = create_source(args)
 
-    # Warn loudly if the source and road.png disagree - points would be
-    # recorded in a coordinate space that does not match the calibration.
+    # Warn if the source and road.png differ in size.
     if isinstance(source, VideoSource) and (source.w, source.h) != (image.shape[1], image.shape[0]):
         print(f"[AVISO] source is {source.w}x{source.h} but road.png is "
               f"{image.shape[1]}x{image.shape[0]} - trajectories will NOT align "

@@ -1,21 +1,5 @@
-"""Bridge between the synchronous detector loop and the asyncio gateway.
-
-The SafeCorners gateway runs as an asyncio app; this detector runs as a
-synchronous while-True loop. We start the gateway on a background thread
-that owns its own event loop, and expose a sync `publish()` that hands
-each detector track to the gateway's RsuAdapter (which is already
-threadsafe via loop.call_soon_threadsafe).
-
-Usage from 5_realTime.py:
-
-    from gateway_glue import start_gateway, publish
-    start_gateway()                           # once, before the main loop
-    ...
-    publish(track_id, obj_class, lat, lon)    # once per confirmed track per frame
-
-If the gateway package is not installed, both calls become no-ops so the
-detector still runs standalone.
-"""
+"""Bridge between the synchronous detector loop and the asyncio gateway,
+which runs on a background thread with its own event loop."""
 from __future__ import annotations
 
 import logging
@@ -34,33 +18,24 @@ _CYCLIST_CLASSES = {"bicycle"}
 
 _started = False
 _loop = None  # asyncio.AbstractEventLoop set on background thread
-# The gateway's duration clock. start_gateway(clock=...) replaces it with a
-# replay clock for recorded footage, so every t_recv stamped here -- RSU tracks
-# and bridged phones alike -- is on the same time base the gateway reads.
+# The duration clock; start_gateway(clock=...) replaces it for a replay.
 _clock = time.monotonic
 _adapter_getter = None  # callable -> RsuAdapter
-_print_pedestrian_gps = True  # toggled by start_gateway(verbose_pedestrians=...)
+_print_pedestrian_gps = True  # set by start_gateway(verbose_pedestrians=...)
 _safewalk_watcher_started = False
-# Which of the detector's OWN observations reach the gateway. "both" is normal
-# operation; the others emulate an occluded or absent RSU for the R5 trials of
-# the evaluation plan §2, with the clip still driving the replay clock. Injected peer
-# observations (phones, scripted actors) are never filtered -- a phone is not
-# the RSU, and mode "none" exists precisely so the cooperative path can be
-# measured alone.
+# Which of the detector's own observations reach the gateway; "both" is normal.
 _RSU_PUBLISH_MODES = {"both", "vehicles", "vru", "none"}
 _rsu_publish = "both"
-# Open CSV of everything published, for scenario authoring (--dump-observations).
+# CSV of everything published (--dump-observations).
 _dump_fh = None
 _dump_fps = 0.0
 # Platform temp dir: /tmp on Linux, the user's temp dir on Windows.
 INJECT_FILE = Path(tempfile.gettempdir()) / "safewalk_inject.txt"
 
-# Latest SafeWalk position published, so the detector can render a marker.
-# Keyed by track_id -> (video_lat, video_lon, monotonic_ts).
+# Latest SafeWalk positions: track_id -> (lat, lon, monotonic time).
 _latest_safewalk: dict = {}
 
-# Live pipeline counters for the detector's on-screen HUD. Fed by the observer
-# passed into run_gateway, so the HUD never has to tail gateway.jsonl.
+# Pipeline counters for the detector's HUD.
 _stats: dict = {
     "ingest_rsu": 0, "ingest_phone": 0,
     "assoc_matched": 0, "assoc_unmatched": 0,
@@ -71,24 +46,16 @@ _stats: dict = {
     "config": None,
     "safewalk": None,    # latest PSM the phone sent (position/kinematics only)
     "last_fuse": None,   # latest non-none fusion: risk, ttc, per-source conf
-    # Per-source: the risk of the most recent fusion this source fed into, so
-    # the HUD can colour each subsystem by the alarm IT is contributing to.
-    # Neither subsystem emits a risk of its own -- the PSM has no risk field
-    # and the RSU publishes raw tracks -- so this is "the risk this source is
-    # currently implicated in", not "the risk this source computed".
+    # Per source, the risk of the latest fusion it fed into.
     "source_risk": {},   # source -> {"risk": str, "t": float}
-    # PSM advertisements the gateway's own BLE scanner saw on the inbound
-    # manufacturer ID but could not decode, broken down by payload length.
-    # A non-zero count against a length the gateway does speak means corrupt
-    # frames; against an unknown length it means a dialect it does not.
+    # PSMs seen but not decoded, in total and by payload length.
     "decode_errors": 0,
     "decode_error_len": {},   # str(payload length) -> count
     # POSTs that decoded but could not become a valid Observation.
     "inject_rejected": 0,
 }
 _stats_lock = threading.Lock()
-# Which sources have gone quiet (R5). Fed from the ingest records, judged in
-# their own timebase -- see SourceFreshness.stale_relative.
+# Which sources have gone quiet; see SourceFreshness.
 _freshness = None   # SourceFreshness, created below once the class exists
 
 
@@ -102,8 +69,7 @@ def _observe(rec: dict) -> None:
                 _stats["ingest_rsu"] += 1
             elif src:
                 _stats["ingest_phone"] += 1
-            # t_scene on a replay run, wall time live: either way the records
-            # share one timebase, which is what staleness is judged in.
+            # t_scene on a replay run, wall time live.
             t_rec = rec.get("t_scene", rec.get("t"))
             if src and t_rec is not None and _freshness is not None:
                 _freshness.saw(src, t_rec)
@@ -127,10 +93,7 @@ def _observe(rec: dict) -> None:
                     "t": time.monotonic(),
                 }
         elif stage == "ble_scanner":
-            # A phone advertising a dialect the gateway cannot parse used to
-            # produce no signal anywhere. Surfacing the count on the HUD means
-            # "the phone is right there and nothing is arriving" is visible at
-            # a glance instead of being inferred.
+            # Undecodable PSMs are counted for the HUD.
             if rec.get("action") == "decode_error":
                 _stats["decode_errors"] += 1
                 n = str(rec.get("bytes"))
@@ -150,23 +113,15 @@ def _observe(rec: dict) -> None:
 def get_gateway_stats() -> dict:
     """Snapshot of the live pipeline counters (safe to call every frame)."""
     with _stats_lock:
-        # Shallow copy plus an explicit copy of every nested container -- a
-        # caller iterating a live dict while the pipeline mutates it raises
-        # RuntimeError, and this is called every frame.
+        # Copies, so a caller can iterate while the pipeline mutates.
         out = dict(_stats)
         out["risk"] = dict(_stats["risk"])
         out["source_risk"] = {k: dict(v) for k, v in _stats["source_risk"].items()}
         out["decode_error_len"] = dict(_stats["decode_error_len"])
-        # last_fuse/safewalk are always rebound wholesale rather than mutated
-        # in place, so aliasing them is safe today -- copy anyway, so that a
-        # future in-place mutation cannot reintroduce the tearing this
-        # function exists to prevent.
         for k in ("last_fuse", "safewalk"):
             if isinstance(_stats.get(k), dict):
                 out[k] = dict(_stats[k])
-        # R5: which subsystems have fallen silent. Reported here rather than on
-        # a timer because this is already called every frame, and logged on the
-        # transition so a quiet source does not print once per frame.
+        # Report the sources that have fallen silent, once per transition.
         if _freshness is not None:
             out["stale_sources"] = _freshness.stale_relative()
             newest = max(_freshness.last_seen.values(), default=None)
@@ -183,22 +138,13 @@ def get_gateway_stats() -> dict:
 
 
 def set_verbose_pedestrians(enabled: bool) -> None:
-    """Toggle the per-pedestrian '[GW] pedestrian track N at lat=...' line.
-
-    It prints once per pedestrian per frame, which at a busy intersection
-    buries everything else in the console. The same information is on the
-    HUD and in gateway.jsonl.
-    """
+    """Toggle the per-pedestrian '[GW] pedestrian track N at lat=...' line."""
     global _print_pedestrian_gps
     _print_pedestrian_gps = bool(enabled)
 
 
 def get_latest_safewalk(max_age_s: float = 2.0) -> dict:
-    """Return {track_id: (lat, lon)} for SafeWalk phantoms seen within max_age_s.
-
-    The detector calls this each frame to draw "YOU" markers on the video.
-    Stale entries (no PSM in the last max_age_s seconds) are filtered out.
-    """
+    """{track_id: (lat, lon)} of SafeWalk phones seen within max_age_s."""
     now = time.monotonic()
     return {tid: (lat, lon)
             for tid, (lat, lon, ts) in _latest_safewalk.items()
@@ -207,15 +153,8 @@ def get_latest_safewalk(max_age_s: float = 2.0) -> dict:
 
 def start_gateway(config_path: Optional[Path] = None,
                   run_id: Optional[str] = None, clock=None) -> bool:
-    """Spin up the gateway on a daemon thread. Returns True on success.
-
-    Safe to call multiple times — subsequent calls are no-ops.
-    Returns False (and logs) if the gateway package isn't installed, or if the
-    gateway did not come up.
-
-    clock: the duration clock for the whole pipeline. Pass a replay clock for
-    recorded footage (scene time); None keeps time.monotonic for live capture.
-    """
+    """Start the gateway on a daemon thread; return True if it came up.
+    Later calls do nothing. clock, if given, is the replay clock."""
     global _started, _loop, _adapter_getter, _clock
     if _started:
         return True
@@ -259,9 +198,7 @@ def start_gateway(config_path: Optional[Path] = None,
                     return
                 except RuntimeError:
                     await asyncio.sleep(0.1)
-            # Do NOT signal ready: that used to mark the gateway started with no
-            # adapter, after which every publish() returned silently and the
-            # detector ran a whole trial blind.
+            # Not signalled as ready: publish() would return silently.
             log.error("gateway adapter never appeared; %r", gateway_task)
 
         loop.create_task(_wait_for_adapter())
@@ -282,13 +219,7 @@ def start_gateway(config_path: Optional[Path] = None,
 
 
 def wait_gateway_idle(timeout: float = 60.0) -> bool:
-    """Block the detector until the gateway has processed everything published.
-
-    Used once per frame on recorded footage (lock-step replay): the replay
-    clock must not advance while the gateway is still working through earlier
-    frames, or observation ages -- and TTCs -- depend on host timing.
-    Returns False (and logs) if the gateway is not running or never drains.
-    """
+    """Block until the gateway has processed everything published so far."""
     if not _started or _loop is None:
         return False
     try:
@@ -304,13 +235,7 @@ def wait_gateway_idle(timeout: float = 60.0) -> bool:
 
 
 def start_observation_dump(path, fps: float) -> None:
-    """Write every published observation to CSV, for scenario authoring.
-
-    The gateway log carries no coordinates, so this is the only record of what
-    the detector actually published. `t_scene` is seconds of video -- the same
-    timebase as the labels of `tools/make-labels.py` -- so a scenario can be
-    built to meet a real recorded vehicle at a real instant.
-    """
+    """Write every published observation to a CSV, in video time."""
     global _dump_fh, _dump_fps
     if _dump_fh is not None:
         return
@@ -334,12 +259,7 @@ def stop_observation_dump() -> None:
 def record_observation_sample(frame_index: int, source: str, track_id: str,
                               basic_type: str, lat: float, lon: float,
                               speed_mps, heading_deg) -> None:
-    """One CSV row. No-op unless start_observation_dump() was called.
-
-    `basic_type` may be given as the detector's own class ("car", "person",
-    "bicycle"); it is recorded canonically ("vehicle", "pedestrian", "cyclist")
-    so the CSV speaks the same vocabulary as association and the script format.
-    """
+    """Write one CSV row; a no-op unless start_observation_dump() was called."""
     if _dump_fh is None:
         return
     basic_type = _basic_type_for(basic_type) or basic_type
@@ -353,14 +273,8 @@ def record_observation_sample(frame_index: int, source: str, track_id: str,
 
 
 def set_rsu_publish_filter(mode: str) -> None:
-    """Restrict the detector's own publications, for the R5 degradation modes.
-
-    "both" (default) is normal operation. "vehicles" emulates an RSU that sees
-    traffic but not the VRU -- the thesis's NLOS case, where the phone has to
-    supply the VRU. "none" emulates an absent RSU. Only `publish()` is affected:
-    injected peer observations still flow, which is what makes the cooperative
-    path measurable on its own.
-    """
+    """Restrict what the detector itself publishes to the gateway:
+    "both", "vehicles", "vru" or "none"."""
     global _rsu_publish
     if mode not in _RSU_PUBLISH_MODES:
         raise ValueError(
@@ -380,15 +294,7 @@ def publish(track_id, obj_class: str, lat: float, lon: float,
             path=None,
             flagged_with=None,
             range_m: Optional[float] = None) -> None:
-    """Publish one detector track to the gateway. No-op if gateway isn't running.
-
-    flagged_with: tracks the RSU's own collision check flagged this one against
-    (its verdict, used by fusion only when unconfirmed_rsu_factor < 1).
-
-    t_recv: the frame's capture time on the gateway clock. The detector passes
-    one value for every track of a frame; stamping each track as it is
-    published spread one camera instant over ~77 ms and across buffer flushes.
-    """
+    """Publish one detector track to the gateway, if it is running."""
     if not _started or _adapter_getter is None:
         return
     basic_type = _basic_type_for(obj_class)
@@ -427,14 +333,8 @@ _SCRIPT_CLASS = {"vehicle": "car", "pedestrian": "person", "cyclist": "bicycle"}
 
 
 def publish_script_sample(sample: dict, t_recv: float, range_of=None) -> None:
-    """Publish one scripted-actor sample along the path its `source` names.
-
-    "RSU": as a detector track -- the RSU adapter, the frame's capture time,
-    the range from the camera (`range_of(lat, lon)`), no GNSS accuracy -- so a
-    constructed conflict can test what the camera alone would do. Anything
-    else (default "SafeWalk"): as a phone report, which is what every scripted
-    actor was before.
-    """
+    """Publish one scripted-actor sample: as a camera track if source is "RSU",
+    else as a phone report."""
     source = sample.get("source", "SafeWalk")
     lat, lon = float(sample["lat"]), float(sample["lon"])
     track_id = str(sample.get("track_id", "SCRIPT-VRU"))
@@ -466,11 +366,7 @@ def _confidence_from_accuracy(accuracy_m: Optional[float]) -> float:
 
 
 def _utc_from_sec_mark(sec_mark: int) -> Optional[float]:
-    """ms-within-the-minute -> absolute UTC, as the BLE-in adapter does it.
-
-    Only used for older scanners that post a bare `secMark`; a current scanner
-    posts `t_sender_utc` directly because it has already decoded the PSM.
-    """
+    """ms within the minute to absolute UTC, as the BLE-in adapter does it."""
     if not sec_mark:
         return None
     try:
@@ -491,23 +387,8 @@ def _publish_safewalk(lat: float, lon: float, track_id: str = "FAKE-PHONE",
                        time_source: Optional[str] = None,
                        radius_of_curve_m: Optional[float] = None,
                        path_confidence: Optional[float] = None) -> None:
-    """Inject one peer PSM (used by the inject-file watcher and HTTP bridge).
-
-    `source` is the producing app as the scanner's decoder determined it from
-    the payload dialect, and is authoritative when supplied. Falling back to
-    basic_type_b is weaker -- SafeWalk cannot emit a cyclist, so basicType
-    alone cannot really distinguish the two apps -- but it keeps older senders
-    working. This whole path used to hardcode SafeWalk/pedestrian, so a
-    cyclist over the HTTP bridge was silently relabelled a pedestrian and
-    SafeBike could never appear as a source here at all.
-
-    t_sender_utc / time_source carry the sender's own clock. The bridge used to
-    drop them and hardcode time_source="unknown", which demoted every
-    observation on this path to the lowest-confidence time regime of §4.4 --
-    even though the phone populates the field and the scanner forwards it. On
-    Windows this is the path that actually runs, so R2's primary clock was
-    unavailable exactly where it mattered.
-    """
+    """Inject one peer PSM (inject-file watcher and HTTP bridge).
+    source and basic_type, when given, take precedence over basic_type_b."""
     if not _started or _adapter_getter is None:
         return
     try:
@@ -523,21 +404,9 @@ def _publish_safewalk(lat: float, lon: float, track_id: str = "FAKE-PHONE",
     if source:
         _src = source
     if basic_type:
-        # The scanner decoded the payload and knows the role; basicType cannot
-        # express "unknown" faithfully and means different things in the two
-        # dialects, so an explicit role wins when one is supplied.
+        # An explicit role takes precedence over basicType.
         _btype = basic_type
-    # Deliberately NOT coerced to "pedestrian". Reporting an unrecognised
-    # basicType as a pedestrian is exactly the role fabrication that was
-    # removed from the BLE path: it puts a road user the sender never claimed
-    # into the VRU population, and every per-class figure then counts it.
-    #
-    # The cost is that an "unknown" observation is neither a VRU nor a vehicle
-    # to stages/associate.py, so it is dropped from pairing. That is the right
-    # trade -- and it is moot with today's senders, since SafeWalk only emits
-    # basicType 0/1 and SafeBike only 2. Should a sender ever use 3 (public
-    # safety worker) or 4 (animal), decide then what those are, rather than
-    # silently having decided already.
+    # An unrecognised basicType stays "unknown".
 
     _tsrc = time_source or "unknown"
     if t_sender_utc is None:
@@ -553,16 +422,11 @@ def _publish_safewalk(lat: float, lon: float, track_id: str = "FAKE-PHONE",
             basic_type=_btype,
             lat=float(lat),
             lon=float(lon),
-            # None stays None. This used to become 0.5 m/s on the bridge path
-            # only, so one phone had different kinematics over BLE and HTTP.
+            # None stays None.
             speed_mps=None if speed_mps is None else float(speed_mps),
             heading_deg=heading_deg if heading_deg is None else float(heading_deg),
             accuracy_m=accuracy_m,
-            # Same GNSS-accuracy -> confidence curve the BLE-in adapter uses, so a
-            # phone reaching the gateway over the HTTP bridge is weighted exactly
-            # as it would be over the radio. This used to be a flat 0.85 with a
-            # made-up 10 m accuracy, which silently discarded the one quality
-            # signal the PSM carries.
+            # The same accuracy-to-confidence curve as the BLE-in adapter.
             confidence=_confidence_from_accuracy(accuracy_m),
             t_sender=None,
             t_sender_utc=t_sender_utc,
@@ -572,12 +436,7 @@ def _publish_safewalk(lat: float, lon: float, track_id: str = "FAKE-PHONE",
             path_confidence=path_confidence,
         )
     except ValueError as e:
-        # A malformed POST must not take down the bridge thread -- but it must
-        # not vanish either. Before the guard existed this raised through to
-        # do_POST and the scanner saw HTTP 400; swallowing it silently traded a
-        # visible failure for an invisible one, which is the specific mistake
-        # that hid the SafeBike wire-format mismatch for the life of the
-        # project. Counted for the HUD, and do_POST reports it.
+        # A malformed PSM is rejected and logged.
         log.warning("rejected injected PSM for %s: %s", track_id, e)
         with _stats_lock:
             _stats["inject_rejected"] += 1
@@ -593,9 +452,7 @@ def _publish_safewalk(lat: float, lon: float, track_id: str = "FAKE-PHONE",
     published = True
     # Cache for the detector overlay: latest SafeWalk position per track_id.
     _latest_safewalk[track_id] = (float(lat), float(lon), time.monotonic())
-    # Fuller snapshot for the HUD: what the phone itself is reporting. Note the
-    # inbound PSM carries no risk field -- SafeWalk broadcasts position and
-    # kinematics only, and the risk verdict is the gateway's.
+    # Snapshot for the HUD of what the phone reports.
     with _stats_lock:
         _stats["safewalk"] = {
             "source": _src,
@@ -607,8 +464,7 @@ def _publish_safewalk(lat: float, lon: float, track_id: str = "FAKE-PHONE",
             "confidence": _confidence_from_accuracy(accuracy_m),
             "t": time.monotonic(),
         }
-    # Throttled "[YOU]" printout so the operator can see their own phantom
-    # tick alongside the detector's [GW] pedestrian lines. ~2 Hz max.
+    # Throttled "[YOU]" printout, about 2 Hz.
     now = time.monotonic()
     if _print_pedestrian_gps and now - _last_you_print[0] >= 0.5:
         _last_you_print[0] = now
@@ -619,19 +475,7 @@ def _publish_safewalk(lat: float, lon: float, track_id: str = "FAKE-PHONE",
 
 
 class SourceFreshness:
-    """When did each source last say anything, and which have gone quiet?
-
-    the architecture doc §7.1 described a staleness monitor that was never implemented, so an
-    RSU that stops publishing looked exactly like an intersection with no
-    traffic. R5 is about continuing to function when a subsystem drops out, and
-    that starts with noticing.
-
-    A source never seen is NOT stale: "SafeBike absent" is normal operation, not
-    a fault. Only sources that have spoken at least once can fall silent.
-
-    `newly_stale` / `newly_returned` report edges rather than levels, so a caller
-    on the frame loop logs once per transition instead of once per frame.
-    """
+    """When each source last reported, and which have gone quiet."""
 
     def __init__(self, silence_s: float = 5.0) -> None:
         self.silence_s = float(silence_s)
@@ -650,16 +494,7 @@ class SourceFreshness:
                       if t - last >= self.silence_s)
 
     def stale_relative(self) -> list:
-        """Stale judged against the newest record seen, so no clock is read.
-
-        The pipeline's timebase is the replay clock on recorded footage, which
-        runs about 9x slower than the wall clock; a wall-clock threshold would
-        call every source stale. Taking the newest observation as "now" is
-        correct in both live and replay runs.
-
-        Limit: if *everything* stops, "now" stops advancing too, so total
-        silence reads as an empty log rather than as a stale source.
-        """
+        """Sources stale against the newest record seen; no clock is read."""
         if not self.last_seen:
             return []
         return self.stale(max(self.last_seen.values()))
@@ -680,23 +515,14 @@ _freshness = SourceFreshness()
 
 
 def publish_peer_observation(**kwargs) -> None:
-    """Public entry point for an injected peer observation.
-
-    Used by the scripted-actor path of the R5 and accuracy trials, so scenario
-    code does not reach for a private name. The keywords are exactly
-    `_publish_safewalk`'s. Deliberately NOT subject to the RSU publish filter: a
-    phone is not the RSU, and `set_rsu_publish_filter("none")` exists so the
-    cooperative path can be measured with the RSU withheld.
-    """
+    """Public entry point for an injected peer observation;
+    not subject to the RSU publish filter."""
     _publish_safewalk(**kwargs)
 
 
 def start_safewalk_injector() -> None:
-    """Start a background thread that watches INJECT_FILE.
-
-    Each line in the file is "lat lon [track_id]". As long as the file
-    exists, we publish a SafeWalk observation at that coord every 0.5s.
-    """
+    """Start a thread that watches INJECT_FILE and publishes its positions;
+    each line is "lat lon [track_id]"."""
     global _safewalk_watcher_started
     if _safewalk_watcher_started:
         return
@@ -726,25 +552,8 @@ def start_safewalk_injector() -> None:
 
 
 class AnchorTranslator:
-    """Real phone coordinates -> the coordinates the gateway is told.
-
-    `translate=True` (recorded footage): the first accepted fix becomes "home"
-    and maps to the video anchor; every later fix is applied as a north/east
-    delta from home. The motion is real, the absolute position is synthetic --
-    which is why a bridged run is not a field trial (the evaluation plan §7).
-
-    `translate=False` (field trial): positions pass through untouched, because
-    the phone is already standing inside the calibrated scene. Translating
-    there displaces the avatar by (first fix - map origin), so the RSU's own
-    detection of that same person can never associate with it and one road
-    user becomes two warning streams .
-
-    Junk fixes are dropped in both modes, and a dropped fix must not become
-    home: SafeWalk emits a placeholder before its first GPS lock, and accepting
-    it as home would shove every later position off-frame -- ~7000 km for the
-    original (12.34, 56.78), the distance to the phone's real position for the
-    BIB_IST test point.
-    """
+    """Real phone coordinates to the coordinates the gateway is told.
+    translate: the first fix maps to the video anchor, later ones by offset."""
 
     R_EARTH_M = 6_371_000.0
 
@@ -757,9 +566,7 @@ class AnchorTranslator:
 
     @staticmethod
     def is_junk(lat: float, lon: float) -> bool:
-        # SafeWalk's placeholders: the original, and the BIB_IST test point it
-        # sends now -- the latter matched to PSM resolution (1e-7 deg), so a
-        # real or simulated fix a metre away still passes.
+        # SafeWalk's placeholders: (12.34, 56.78) and the BIB_IST test point.
         return bool((abs(lat - 12.34) < 1e-3 and abs(lon - 56.78) < 1e-3)
                     or (abs(lat - 38.7367524) < 5e-7 and abs(lon + 9.1437386) < 5e-7)
                     or (abs(lat) < 1e-6 and abs(lon) < 1e-6)
@@ -794,29 +601,8 @@ def start_safewalk_http_bridge(host: str = "0.0.0.0", port: int = 8765,
                                force_heading_deg: Optional[float] = None,
                                force_speed_mps: Optional[float] = None,
                                translate: bool = True) -> None:
-    """HTTP bridge: accept POSTed SafeWalk PSMs from the Windows scanner, translate
-    real-world coords to video-anchor coords, and publish to the gateway.
-
-    Endpoint: POST http://<host>:8765/psm
-        body: JSON {"lat": 38.6423, "lon": -9.1573, "track_id": "SM-S918",
-                    "speed_mps": 0.5, "heading_deg": 90, "secMark": 17338}
-
-    The first POST establishes the "real world home" anchor. Each subsequent
-    POST computes (dnorth, deast) in meters from home and applies that delta
-    to (video_anchor_lat, video_anchor_lon) before pushing to the gateway.
-    Result: walking 5 m east IRL moves the avatar 5 m east in the video frame.
-
-    If no video anchor is given, defaults to the map.txt origin.
-
-    force_heading_deg / force_speed_mps:
-        For remote-testing demos: phone GPS heading reflects the real-world
-        street, not the video's street geometry. Set force_heading_deg=0 to
-        always report "pedestrian walking north across the road" (or whatever
-        direction puts you in collision course with traffic in the video).
-        Same idea for force_speed_mps if you want a stable demo trajectory.
-        In a production on-site deployment, leave both as None to use the
-        phone's real values.
-    """
+    """HTTP bridge: accept PSMs POSTed as JSON to /psm, translate them to the
+    scene's coordinates and publish them to the gateway."""
     if video_anchor_lat is None or video_anchor_lon is None:
         # default to map.txt origin
         try:
@@ -831,8 +617,6 @@ def start_safewalk_http_bridge(host: str = "0.0.0.0", port: int = 8765,
             log.error("could not read map.txt: %s", e)
             return
 
-    # The translation lives in AnchorTranslator so it can be tested without
-    # starting a server, and so a field trial can switch it off.
     _translate = AnchorTranslator(video_anchor_lat, video_anchor_lon,
                                   translate=translate)
 
@@ -852,23 +636,13 @@ def start_safewalk_http_bridge(host: str = "0.0.0.0", port: int = 8765,
                 tid = body.get("track_id", "PHONE")
                 spd = body.get("speed_mps")
                 hdg = body.get("heading_deg")
-                # GNSS accuracy ellipse (semi-major, metres). Drives the
-                # source confidence, so a degraded urban-canyon fix is
-                # weighted down rather than trusted like an open-sky one.
+                # GNSS accuracy in metres; it sets the source confidence.
                 acc = body.get("accuracy_m")
-                # basicType decides SafeWalk-pedestrian vs SafeBike-cyclist,
-                # but only as a fallback: a scanner that decoded the payload
-                # knows which app sent it from the wire dialect and says so in
-                # `source`, which is authoritative when present.
+                # basicType is the fallback when the scanner sends no source.
                 btype = int(body.get("basicType", 1))
                 src = body.get("source")
                 btype_name = body.get("basic_type")
-                # Sender clock. Previously dropped here, which demoted every
-                # bridged observation to time_source="unknown" even when the
-                # phone had populated it -- the same decode-then-discard
-                # failure as the accuracy field before it. `secMark` is still
-                # accepted from older scanners and reconstructed against
-                # gateway wall time the way the BLE adapter does it.
+                # Sender clock, or secMark if t_sender_utc is absent.
                 t_sender_utc = body.get("t_sender_utc")
                 tsrc = body.get("time_source")
                 if t_sender_utc is None and body.get("secMark"):
@@ -876,19 +650,14 @@ def start_safewalk_http_bridge(host: str = "0.0.0.0", port: int = 8765,
                     tsrc = tsrc or "GPS"
                 rcurve = body.get("radius_of_curve_m")
                 pconf = body.get("path_confidence")
-                # Demo-mode overrides: pin heading/speed regardless of what
-                # the phone reports. Used when the phone is in a different
-                # geography than the video and its real heading wouldn't
-                # produce a meaningful TTC against the video's traffic.
+                # Demo overrides: pin heading and speed.
                 if force_heading_deg is not None:
                     hdg = float(force_heading_deg)
                 if force_speed_mps is not None:
                     spd = float(force_speed_mps)
                 translated = _translate(real_lat, real_lon)
                 if translated is None:
-                    # Placeholder PSM (no GPS lock yet) -- accept the HTTP
-                    # request so the scanner doesn't retry-storm, but skip
-                    # publishing to the gateway.
+                    # Placeholder PSM: answer 200 but do not publish.
                     self.send_response(200)
                     self.end_headers()
                     self.wfile.write(b'{"ok":true,"skipped":"no_gps_lock"}')
@@ -902,9 +671,7 @@ def start_safewalk_http_bridge(host: str = "0.0.0.0", port: int = 8765,
                                   radius_of_curve_m=rcurve,
                                   path_confidence=pconf)
                 if accepted is False:
-                    # Decoded fine, but the values do not form a valid
-                    # Observation. 400 so the sender sees it, matching the
-                    # behaviour before the handler-thread guard was added.
+                    # Decoded, but not a valid Observation: answer 400.
                     self.send_response(400)
                     self.end_headers()
                     self.wfile.write(b'{"error":"rejected: invalid observation"}')
@@ -928,12 +695,7 @@ def start_safewalk_http_bridge(host: str = "0.0.0.0", port: int = 8765,
                              f"video_anchor=({video_anchor_lat}, {video_anchor_lon})\n".encode())
 
     def _server() -> None:
-        # Threading, not plain HTTPServer. BLE re-advertises the same PSM
-        # several times a second and the scanner POSTs each sighting, so a
-        # single-threaded server serialises them: while one request is being
-        # handled the rest sit in the accept queue and blow the scanner's
-        # 0.5 s read timeout, which looks like "the bridge is down" when it
-        # is really just busy.
+        # Threading server: the scanner POSTs several times a second.
         srv = ThreadingHTTPServer((host, port), _Handler)
         srv.daemon_threads = True
         if translate:
@@ -959,23 +721,8 @@ def _basic_type_for(obj_class: str) -> Optional[str]:
 
 
 def _default_config_path() -> Path:
-    """Pick the gateway config, and say out loud which one was chosen.
-
-    gateway.demo.yaml loosens association so a demo still fires: radius 25 m
-    instead of 10, score threshold 0.2 instead of 0.6, and heading/speed
-    weights set to 0 so those terms are ignored entirely. That is useful for
-    showing the pipeline working, but it disables two of the four association
-    terms thesis 4.5 specifies, so numbers produced under it must not be
-    reported as evaluation results.
-
-    Selection order:
-      1. SAFECORNERS_GATEWAY_CONFIG   explicit path, always wins
-      2. gateway.yaml                 production thresholds (default)
-      3. gateway.demo.yaml            only via SAFECORNERS_GATEWAY_PROFILE=demo
-
-    This used to silently prefer the demo file whenever it existed, which made
-    it very easy to evaluate against loosened thresholds without noticing.
-    """
+    """Pick the gateway config and log which: SAFECORNERS_GATEWAY_CONFIG, else
+    gateway.yaml (gateway.demo.yaml if SAFECORNERS_GATEWAY_PROFILE=demo)."""
     here = Path(__file__).resolve()
     base = here.parents[2] / "SafeCorners-Gateway"
 

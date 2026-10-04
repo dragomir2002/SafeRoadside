@@ -65,8 +65,7 @@ def load_map_data(map_file="map.txt"):
             row_vals = list(map(float, lines[i].split()))
             h_rows.append(row_vals)
 
-        # float64: in float32 the lat/lon arithmetic quantised every published
-        # position to a 0.38 m grid (see rsu_kinematics.py).
+        # float64, so positions are not quantised.
         homography_mat = np.array(h_rows, dtype=np.float64)
 
         if homography_mat.shape != (3, 3):
@@ -242,8 +241,7 @@ _DEVICE = "cuda" if _torch.cuda.is_available() else "cpu"
 print(f"[INFO] YOLO device: {_DEVICE}")
 model = YOLO("models/yolo11n.pt").to(_DEVICE) # TODO é possivel alterar ete valor para outros modelos do YOLO
 def make_deepsort():
-    """The original tracker. Built only when selected: its appearance embedder
-    loads onto the GPU, which a --tracker bytetrack run never uses."""
+    """Build the DeepSort tracker (only when it is selected)."""
     return DeepSort( # TODO ver se ja outra versoes mais fortes do yolo
         max_age=1000,
         n_init=5,
@@ -289,17 +287,13 @@ color_map = {}
 point_history = {}
 missing_track_counter = {}
 
-# Pixel thresholds, expressed at the 1080p reference resolution they were
-# tuned on. calibrate_thresholds() rescales them once the true frame width is
-# known, so the same value means the same real-world distance at any
-# resolution. Without this a 4K scene halves every effective threshold.
+# Pixel thresholds at the 1080p reference; calibrate_thresholds() rescales them.
 REFERENCE_WIDTH = 1920.0
 MIN_DISTANCE_THRESHOLD = 20
 COLLISION_THRESHOLD = 30
 TRAJ_SCORE_THRESHOLD = 3000
 
-# Multiplier for box thickness / font size / marker radii, so annotations stay
-# legible on a 4K frame instead of rendering hairline-thin.
+# Multiplier for box thickness, font size and marker radii.
 DRAW_SCALE = 1.0
 
 
@@ -323,16 +317,12 @@ def calibrate_thresholds(frame_width, args):
 
 vehicle_classes = ['car', 'truck', 'bus', 'motorcycle']
 pedestrian_class = 'person'
-# SafeBike's counterpart on the RSU side. YOLO labels the bicycle, not the
-# rider, so a cyclist usually also raises a 'person' track at the same spot;
-# both are VRUs and both are predicted with the EKF below.
+# YOLO labels the bicycle, not the rider; both are VRUs.
 cyclist_classes = ['bicycle']
 vru_classes = [pedestrian_class] + cyclist_classes
 
 
-# -----------------------------------------------------------------------------
-# 6.1) INPUT SOURCE — video file, specific monitor, or screen region
-# -----------------------------------------------------------------------------
+# 6.1) Input source: video file, monitor or screen region.
 def parse_args():
     parser = argparse.ArgumentParser(
         description="SafeRoadside — Real-time collision detection",
@@ -485,9 +475,7 @@ def parse_args():
         help="Skip the SafeCorners fusion gateway / SafeWalk bridge and run\n"
              "the pure computer-vision pipeline only"
     )
-    # Pixel thresholds below were tuned on 1080p. They are multiplied by
-    # (frame_width / 1920) at runtime so a 4K scene behaves the same in
-    # METRES as a 1080p one. Pass a value to pin it instead.
+    # Pixel thresholds scale with frame_width / 1920; pass a value to pin one.
     parser.add_argument(
         "--collision-threshold", type=float, default=None,
         help="Pixel distance for a predicted collision (default: 30 @1080p, scaled)"
@@ -515,8 +503,7 @@ class VideoSource:
         w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         self.fps = self.cap.get(cv2.CAP_PROP_FPS)
-        # Frames successfully read, across --loop restarts: the replay clock's
-        # frame index must never go backwards.
+        # Frames read, across --loop restarts.
         self.frames_read = 0
         print(f"[INFO] Source: video '{path}' ({w}x{h}, {self.fps:.3f} fps)")
 
@@ -592,7 +579,7 @@ def create_source(args):
     if size:
         print(f"[INFO] screen frames resized to {size[0]}x{size[1]} (--capture-size)")
 
-    # No argument → interactive monitor picker
+    # No argument: interactive monitor picker.
     if source_str is None:
         region = pick_monitor_interactive()
         return ScreenSource(region, size)
@@ -619,7 +606,7 @@ def create_source(args):
         print(f"[INFO] Source: screen region {w}x{h} at ({x},{y})")
         return ScreenSource(region, size)
 
-    # Otherwise → video file
+    # Otherwise: a video file.
     if size:
         print("[ERRO] --capture-size applies to screen capture only")
         sys.exit(2)
@@ -659,13 +646,7 @@ HDR = 1.35   # section headers are this much bigger than detail lines
 
 
 def _source_colour(stats, source, now_m, fallback, window_s=3.0):
-    """Colour a subsystem block by the risk of the fusion it just fed.
-
-    Neither subsystem emits a risk of its own -- the PSM has no risk field and
-    the RSU publishes raw tracks -- so this shows the alarm the source is
-    currently implicated in. Falls back to its liveness colour when it has not
-    contributed recently.
-    """
+    """Colour of a subsystem block: the risk of the fusion it last fed."""
     sr = (stats.get("source_risk") or {}).get(source)
     if sr and (now_m - sr.get("t", 0.0)) < window_s:
         return _RISK_COLOR.get(sr.get("risk"), fallback), sr.get("risk")
@@ -687,19 +668,12 @@ _RISK_COLOR = {
 
 def draw_hud(frame, lines, scale=1.0):
     """Draw a translucent status panel in the top-left corner.
-
-    Each entry of `lines` is (text, colour) or (text, colour, size_mult).
-    size_mult scales that line's font, so section headers can be bigger than
-    their detail lines. Kept deliberately compact: the console is unusable for
-    watching a run because the gateway logs several lines per frame, so this
-    panel is the thing you actually watch.
-    """
+    Each entry of lines is (text, colour) or (text, colour, size_mult)."""
     font = cv2.FONT_HERSHEY_SIMPLEX
     base_fs = 0.55 * scale
     pad = int(10 * scale)
 
-    # Measure first: line heights vary now, so the panel has to be sized from
-    # the actual text rather than a fixed per-line constant.
+    # Measure first: the panel is sized from the text.
     rows = []
     total_h = pad
     max_w = 0
@@ -735,11 +709,7 @@ def get_random_color():
 
 def is_point_far_enough(new_point, last_point, threshold=None):
     """Verifica se a distância entre dois pontos é maior que 'threshold'.
-
-    threshold defaults to the *current* MIN_DISTANCE_THRESHOLD. It must be
-    read at call time, not bound as a default argument, because
-    calibrate_thresholds() rewrites it after the first frame is known.
-    """
+    threshold defaults to MIN_DISTANCE_THRESHOLD, read at call time."""
     if threshold is None:
         threshold = MIN_DISTANCE_THRESHOLD
     return np.linalg.norm(np.array(new_point) - np.array(last_point)) > threshold
@@ -759,10 +729,8 @@ def main():
             print("[ERRO] --rsu-conflict-log needs a recorded source")
             sys.exit(2)
         conflict_log = open(args.rsu_conflict_log, "w", encoding="utf-8", buffering=1)
-    # None selects ByteTrack, which lives inside model.track() rather than in a
-    # tracker object of our own.
-    # Ground projection policy for this scene: which pixel of a box is on the
-    # road, and how far a detection may be before the map stops meaning anything.
+    # None selects ByteTrack, which runs inside model.track().
+    # Ground projection of this scene: box pixel and range limit.
     _max_range_m = args.max_range_m
     _cam_ref = None
     _cam_ref_resolved = False
@@ -785,8 +753,7 @@ def main():
     calibrated = False     # thresholds rescaled on the first frame
 
     if args.quiet:
-        # The gateway and its libraries log several lines per frame; at a busy
-        # intersection that makes the console useless for watching a run.
+        # Quiet the per-frame console lines.
         set_verbose_pedestrians(False)
         logging.getLogger("safecorners_gateway").setLevel(logging.WARNING)
         logging.getLogger("deep_sort_realtime").setLevel(logging.WARNING)
@@ -796,10 +763,7 @@ def main():
 
     print("[INFO] Starting detection loop... (press 'q' on the window to quit)")
 
-    # Time base for everything the gateway measures. Recorded footage replays
-    # slower than real time, so its clock is the video's own: one frame is
-    # 1/fps seconds of scene. Live capture runs in real time, so wall time is
-    # scene time. See rsu_kinematics.ReplayClock.
+    # Recorded footage runs on the video's own clock, live capture on wall time.
     if isinstance(source, VideoSource):
         clock = ReplayClock(source.fps)
         print(f"[INFO] replay clock: scene time = frame index / {source.fps:.3f} fps")
@@ -812,9 +776,7 @@ def main():
     if args.no_gateway:
         print("[INFO] gateway disabled (--no-gateway) - CV pipeline only")
     else:
-        # Only a replay clock is injected: the gateway labels a run "replay"
-        # exactly when it is given a clock, and live capture runs on its own
-        # monotonic clock (passing time.monotonic here mislabelled live runs).
+        # Only a replay clock is passed to the gateway.
         replay_clock = clock if isinstance(clock, ReplayClock) else None
         if not start_gateway(run_id=args.run_id, clock=replay_clock):
             print("[ERRO] gateway failed to start; refusing to run blind "
@@ -842,9 +804,7 @@ def main():
                   f"actors {actors}")
         else:
             start_safewalk_injector()
-        # Anchor the SafeWalk avatar on THIS scene's origin. It used to be
-        # pinned to the Michigan demo clip (41.9407, -85.0010), which put the
-        # avatar ~7000 km away from any non-demo scene and killed fusion.
+        # Anchor the SafeWalk avatar on this scene's origin.
         start_safewalk_http_bridge(video_anchor_lat=lat0_deg,
                                    video_anchor_lon=lon0_deg,
                                    translate=not args.no_translate)
@@ -864,9 +824,7 @@ def main():
                 clock.set_frame(source.frames_read - 1)
             t_frame = clock()   # ONE capture time for every track of this frame
 
-            # Scripted actors ride the same clock as the detector's own tracks,
-            # so a constructed conflict happens at a known second of video. An
-            # actor with "source": "RSU" is published as a camera track would be.
+            # Scripted actors run on the same clock as the detector's tracks.
             if vru is not None:
                 for sample in vru.due((source.frames_read - 1) / clock.fps):
                     if sample.get("source") == "RSU" and _range_ref is None:
@@ -880,9 +838,7 @@ def main():
 
             orig_h, orig_w = frame.shape[:2]
             if _max_range_m is not None and not _cam_ref_resolved:
-                # The nearest visible road surface, once the frame size is
-                # known. Resolved once: if it maps to the horizon there is no
-                # reference and the guard cannot run, which is said once too.
+                # The nearest visible road surface, resolved once.
                 _cam_ref_resolved = True
                 _cam_ref = camera_reference_latlon(homography_mat, lat0_deg,
                                                    lon0_deg, orig_w, orig_h)
@@ -913,12 +869,9 @@ def main():
                 infer_frame = frame
 
             # 3) Detecção com YOLO (on smaller frame)
-            # imgsz must be explicit: without it ultralytics letterboxes to its
-            # 640 px default, discarding the 1920 resize above (on BIB_IST's
-            # frame 0 that is 10 vehicles detected instead of 23).
+            # imgsz is explicit, or ultralytics letterboxes to 640 px.
             if tracker is None:
-                # 3+4) ByteTrack: detection and tracking in one call. persist
-                # keeps the tracker's state on the model between frames.
+                # 3+4) ByteTrack: detection and tracking in one call.
                 results = model.track(infer_frame, imgsz=INFER_WIDTH, persist=True,
                                       tracker=args.tracker_cfg, verbose=False)
                 tracks = tracks_from_boxes(results[0].boxes, scale)
@@ -974,12 +927,7 @@ def main():
 
                 obj_class = model.names[int(track.get_det_class())]
 
-                # Predicted path, computed here rather than in the drawing
-                # section below so the gateway can be given it too. Vehicles
-                # are matched against the scene's reference trajectories,
-                # VRUs run through an EKF; association otherwise extrapolates
-                # a straight line, which at an intersection is true of almost
-                # nothing.
+                # Predicted path, so the gateway can be given it too.
                 if obj_class in vehicle_classes:
                     predicted_px = find_best_trajectory(
                         list(point_history[track_id])[-20:], predefined_trajectories,
@@ -993,17 +941,10 @@ def main():
                 # Atribui cor única
                 color = color_map.setdefault(track_id, get_random_color())
 
-                # Publish this track to the SafeCorners gateway. Geometry and
-                # velocity live in rsu_kinematics: float64, and a scene-time
-                # baseline instead of one wall-clock frame step.
+                # Publish this track to the SafeCorners gateway.
                 if not args.no_gateway:
                     try:
-                        # Unrounded pixels: truncating to int and halving threw
-                        # away up to a pixel, which is metres at the ranges
-                        # that set the 4-8 s band. --ground-point picks which
-                        # pixel of the box stands on the road, --max-range-m
-                        # drops anything the map cannot place (see
-                        # rsu_kinematics.observation_latlon).
+                        # Unrounded pixels; --ground-point picks the box pixel.
                         _ll = observation_latlon(ltrb, homography_mat,
                                                  lat0_deg, lon0_deg,
                                                  ground_point=args.ground_point,
@@ -1011,11 +952,7 @@ def main():
                                                  reference=_cam_ref)
                         if _ll is not None:
                             _spd, _hdg = kin.update(track_id, t_frame, _ll[0], _ll[1])
-                            # R8: how much to trust this detection. The camera
-                            # is not equally good everywhere -- depth
-                            # resolution collapses towards the horizon -- so
-                            # confidence falls with range and the box's own
-                            # placement error goes out as accuracy_m.
+                            # Confidence falls with range.
                             _conf, _acc = 0.85, None
                             if args.rsu_confidence == "range":
                                 _ref = _cam_ref or camera_reference_latlon(
@@ -1026,20 +963,16 @@ def main():
                                 _acc = ground_point_error_m(ltrb, homography_mat,
                                                             lat0_deg, lon0_deg)
                             _path = None
-                            # len(), not truthiness: the predictors return
-                            # numpy arrays, and bool(array) raises.
+                            # len(), not truthiness: these are numpy arrays.
                             if args.rsu_path and len(predicted_px) > 0:
                                 _pts = [pixel_to_latlon(px, py, homography_mat,
                                                         lat0_deg, lon0_deg)
                                         for px, py in predicted_px]
                                 _pts = [q for q in _pts if q is not None]
                                 if _pts:
-                                    # Starts at where the object is now, so the
-                                    # gateway can walk it by arc length.
+                                    # The path starts at the current position.
                                     _path = tuple([(_ll[0], _ll[1])] + _pts)
-                            # Distance from the camera, so the gateway can
-                            # limit camera-only pairs by range and still pair a
-                            # far vehicle with a pedestrian on a phone.
+                            # Distance from the camera.
                             if _range_ref is None:
                                 _range_ref = _cam_ref or camera_reference_latlon(
                                     homography_mat, lat0_deg, lon0_deg,
@@ -1056,8 +989,7 @@ def main():
                                 lat=_ll[0], lon=_ll[1],
                                 speed_mps=_spd, heading_deg=_hdg)
                     except Exception as _e:
-                        # Never let publishing break the detector -- but never
-                        # let it fail silently either.
+                        # A publishing error is reported once.
                         if not getattr(main, "_publish_warned", False):
                             print(f"[AVISO] gateway publish failed: {_e!r} "
                                   f"(further failures not printed)")
@@ -1095,9 +1027,7 @@ def main():
 
             kin.prune(t_frame)   # forget tracks unseen for more than max_gap_s
 
-            # Lock-step replay: let the gateway finish this frame before the
-            # replay clock moves on, so its decisions do not depend on how far
-            # the detector got ahead (see safecorners_gateway.main.wait_idle).
+            # Lock-step replay: the gateway finishes this frame first.
             if replay_clock is not None and not wait_gateway_idle():
                 print("[ERRO] gateway did not drain; stopping rather than "
                       "producing timing-dependent results")
@@ -1126,16 +1056,11 @@ def main():
                             lat_deg, lon_deg = xy_to_latlon(X, Y, lat0_deg, lon0_deg)
 
                             if not args.quiet:
-                                # One line per conflicting point pair per frame:
-                                # unreadable at a busy intersection. The HUD
-                                # shows the live count, gateway.jsonl keeps all.
+                                # One line per conflicting pair per frame.
                                 print(f"[ALERTA] Possível colisão futura em pixel=({Px},{Py}) "
                                       f"-> lat/lon=({lat_deg:.6f}, {lon_deg:.6f})")
 
-                            # shared/data.txt is the BLE sender's outbox. It is
-                            # capped at 5 pending alerts; a stale full file from
-                            # a previous run silently swallows every new alert,
-                            # so say so rather than failing quietly.
+                            # shared/data.txt is the BLE sender's outbox.
                             file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "shared", "data.txt")
 
                             try:
@@ -1156,9 +1081,7 @@ def main():
                             except OSError as e:
                                 print(f"[AVISO] could not update {file_path}: {e}")
 
-            # 7.1) The pairs step 7 flagged, per track: published with the NEXT
-            # frame's observations (step 7 runs after publishing, so the verdict
-            # lags by one frame), and optionally logged for scoring.
+            # 7.1) The pairs step 7 flagged, published with the next frame.
             _flagged = conflict_pairs(future_car_points, future_car_owner,
                                       future_vru_points, future_vru_owner,
                                       COLLISION_THRESHOLD)
@@ -1174,9 +1097,7 @@ def main():
                         "veh": str(veh), "vru": str(vru_tid),
                         "min_px": round(d_px, 1)}) + "\n")
 
-            # 7.5) SafeWalk avatar overlay -- draw "YOU" markers for any
-            # phone that has published a PSM in the last ~2 s. Maps lat/lon
-            # back through the inverse homography to a pixel coordinate.
+            # 7.5) SafeWalk avatar: "YOU" markers for phones seen lately.
             try:
                 for sw_tid, (sw_lat, sw_lon) in get_latest_safewalk().items():
                     sX, sY = latlon_to_xy(sw_lat, sw_lon, lat0_deg, lon0_deg)
@@ -1194,8 +1115,7 @@ def main():
             except Exception as _e:
                 pass  # never let overlay errors crash the detector
 
-            # 7.6) HUD -- the console prints several gateway lines per frame,
-            # so this panel is what you actually watch a run on.
+            # 7.6) HUD.
             if not args.no_hud:
                 st = get_gateway_stats()
                 now_m = time.monotonic()
@@ -1203,8 +1123,7 @@ def main():
                 idx, total = source.progress() if hasattr(source, "progress") else (frame_count, 0)
                 pos = f"{idx}/{total}" if total else f"{frame_count}"
                 cfg_name = st["config"] or "standalone"
-                # Orange when a demo config is loaded: the one thing you must
-                # notice before trusting a run.
+                # Orange when a demo config is loaded.
                 cfg_col = (0, 165, 255) if "demo" in cfg_name else None
 
                 WHITE, DIM = (255, 255, 255), (165, 165, 165)
@@ -1220,12 +1139,7 @@ def main():
                     age_s = now_m - sw["t"]
                     live = age_s < 2.0
                     scol = (0, 255, 0) if live else (0, 200, 255)
-                    # Confidence as the fusion actually used it (freshness
-                    # weighted) if this source fed the last decision; otherwise
-                    # the raw GNSS-accuracy confidence the PSM earns on its own.
-                    # Which peer app this is -- SafeWalk (pedestrian) or
-                    # SafeBike (cyclist). Driven by the PSM's basicType, not
-                    # assumed, so a cyclist shows up as SafeBike.
+                    # The confidence fusion used, else the PSM's own.
                     sw_src = sw.get("source") or "SafeWalk"
                     swc = fz.get(sw_src)
                     own = sw.get("confidence")
@@ -1315,7 +1229,7 @@ def main():
 
     finally:
         source.release()
-        stop_observation_dump()      # flush the CSV even if the run was cut short
+        stop_observation_dump()  # flush the CSV
         if writer is not None:
             writer.release()
             print(f"[OK] annotated video saved -> {args.save_video}")
@@ -1328,16 +1242,7 @@ def main():
 if __name__ == "__main__":
     main()
 
-    # The gateway owns two daemon threads that block forever by design: an
-    # asyncio loop in run_forever() and the SafeWalk bridge in serve_forever().
-    # Neither unwinds at interpreter shutdown, and killing them mid-teardown
-    # made the process report exit 255 even on a fully successful run -- which
-    # breaks any script or CI step that checks the exit code.
-    #
-    # Nothing is lost by exiting hard here: main() has already released the
-    # video writer, and the gateway's JSONL log is opened line-buffered
-    # (buffering=1), so every record is on disk as it is written. Flush our own
-    # streams first, then go.
+    # The gateway's daemon threads never unwind: exit at once.
     sys.stdout.flush()
     sys.stderr.flush()
     os._exit(0)

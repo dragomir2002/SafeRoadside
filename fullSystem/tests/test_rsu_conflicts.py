@@ -1,9 +1,4 @@
-"""Which vehicle-VRU track pairs the RSU's own pixel collision check flags.
-
-The detector draws a red blob wherever a vehicle's predicted point and a VRU's
-come closer than COLLISION_THRESHOLD pixels, but it flattens the points and
-forgets whose they were. This recovers the pairs, under the same strict rule.
-"""
+"""Which vehicle-VRU track pairs the RSU's own collision check flags."""
 from rsu_conflicts import conflict_pairs
 
 

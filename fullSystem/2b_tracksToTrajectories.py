@@ -1,23 +1,4 @@
-"""
-Step 2b - Turn raw tracked vehicle paths into reference trajectories.
-
-An automatic, reproducible alternative to hand-drawing in step 3. It consumes
-the per-track pixel paths dumped by 2_guideDraw.py --dump-tracks and keeps only
-the tracks that actually describe a vehicle travelling through the scene.
-
-Rejected by design:
-  * parked cars          - large point count, near-zero net displacement
-  * detector flicker     - too few points / too short a path
-  * ID-switch chimeras   - path wanders instead of progressing (low straightness)
-  * duplicates           - many cars follow the same lane; keep a representative set
-
-Output is trajetorias.txt in the SAME pixel space as the input tracks, ready
-for 4_cleanTrajectories.py.
-
-Usage
-    python 2b_tracksToTrajectories.py --tracks guide_tracks.txt \
-        --out trajetorias.txt --preview trajectories_preview.png
-"""
+"""Step 2b: turn the vehicle paths of step 2 into reference trajectories."""
 import argparse
 import math
 import os

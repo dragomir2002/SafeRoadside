@@ -1,22 +1,5 @@
-"""
-Step 3 - Draw reference trajectories over withguide.png.
-
-Controls
-    left-click + drag    freehand trajectory
-    right-click twice    straight line between the two points
-    u                    undo last trajectory
-    s                    save now (without quitting)
-    ESC / close window   save and quit
-
-COORDINATE SPACE (important)
-    The background is shown fit-to-window, but every saved point is scaled back
-    to the FULL RESOLUTION of withguide.png. trajetorias.txt therefore always
-    lives in the same pixel space as road.png / map.txt / the source video.
-
-    The previous version of this script recorded raw 1920x1080 window
-    coordinates, so on any scene whose imagery was not exactly 1920x1080 the
-    reference trajectories silently disagreed with the detector's coordinates.
-"""
+"""Step 3: draw reference trajectories over withguide.png. Drag: freehand;
+right-click twice: line; u: undo; s: save; ESC: save and quit."""
 import pygame
 import random
 import sys

@@ -101,11 +101,8 @@ def latlon_to_xy(lat_deg, lon_deg, lat0_deg, lon0_deg):
 # --- calibration from a points file (--points) --------------------------------
 
 def load_points(path):
-    """Calibration points: CSV with header name,lat,lon,px,py.
-
-    lat/lon in decimal degrees (south and west negative). px/py are pixels of
-    the full-resolution calibration image, blank for points still to be clicked.
-    """
+    """Read calibration points from a CSV with header name,lat,lon,px,py;
+    px and py are blank for points still to be clicked."""
     def num(s):
         s = (s or "").strip()
         return float(s) if s else None
@@ -132,13 +129,8 @@ def _project(H, pixels):
 
 
 def fit_map(pixels, latlons):
-    """Pixel -> local metres homography, fitted as the click flow fits it
-    (RANSAC, 5 m), plus a quality figure per point.
-
-    residual_m: the point's error under the fitted H. loo_m: its error under an
-    H fitted without it (leave-one-out) -- the honest one, because a point
-    always pulls a fit towards itself. inlier: kept by RANSAC.
-    """
+    """Fit the pixel-to-metres homography (RANSAC) and give each point's error:
+    residual_m under the fit, loo_m under a fit without that point."""
     origin = (float(latlons[0][0]), float(latlons[0][1]))
     src = np.asarray(pixels, dtype=np.float64)
     dst = np.array([latlon_to_xy(la, lo, *origin) for la, lo in latlons], dtype=np.float64)
@@ -165,10 +157,7 @@ def write_map(path, origin, H):
 
 
 def click_missing(img, points, win="calibration - click the named point, ESC stops"):
-    """Fill blank px/py by clicking. The image is shown fitted to the screen and
-    clicks are scaled back to full resolution; a 4x inset of the full image
-    under the cursor helps aim. Precision is about one displayed pixel (~2-3 px
-    of a 4K image), so reading px/py from an image viewer is better."""
+    """Fill blank px/py by clicking on the image."""
     h, w = img.shape[:2]
     scale = min(1600.0 / w, 900.0 / h, 1.0)
     small = cv2.resize(img, (int(w * scale), int(h * scale)))
@@ -208,9 +197,7 @@ def click_missing(img, points, win="calibration - click the named point, ESC sto
 
 
 def draw_check(img, points, fit, grid_m=5.0):
-    """The calibration drawn over the image: each point where it was clicked
-    (green circle) and where its lat/lon lands through the fit (red cross),
-    labelled with its leave-one-out error, over a grid_m ground grid."""
+    """Draw each point as clicked and as fitted, over a ground grid."""
     out = img.copy()
     Hinv = np.linalg.inv(np.asarray(fit["H"], dtype=np.float64))
     xy = np.array([latlon_to_xy(p["lat"], p["lon"], *fit["origin"]) for p in points])
